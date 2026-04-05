@@ -35,7 +35,7 @@ services:
             context: ..
             dockerfile: docker/Dockerfile
             target: prod
-        image: ${REGISTRY}vdms-dataprep:${TAG:-latest}
+        image: ${REGISTRY}vdms-dataprep:2.0.0-rc1
         environment:
             no_proxy: ${no_proxy},${VDMS_VDB_HOST},${MULTIMODAL_EMBEDDING_HOST},${MINIO_HOST},localhost
             http_proxy: ${http_proxy}

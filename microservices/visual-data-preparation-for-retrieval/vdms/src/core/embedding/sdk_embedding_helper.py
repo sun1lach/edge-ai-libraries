@@ -45,6 +45,11 @@ from PIL import Image
 from src.common import logger
 from src.common import settings
 from src.common import sanitize_for_log
+from src.common import get_tracer
+from src.common import shutdown_tracer
+from src.common import init_tracer
+from src.common import now_us
+from src.common import Tracer
 
 from src.core.embedding.decoder import SharedMemoryPool
 from src.core.embedding.decoder import VideoFrameConfig
@@ -257,7 +262,7 @@ def get_global_detector(enable_object_detection: bool = True, detection_confiden
                     "Global object detector initialized with confidence threshold: %s",
                     sanitize_for_log(detection_confidence, max_length=32),
                 )
-                
+
         except Exception as e:
             logger.error(f"Failed to initialize global object detector: {e}")
             _global_detector = None
@@ -480,9 +485,10 @@ class SimplePipelineManager:
                 "Using global object detector with confidence threshold: %s",
                 sanitize_for_log(self.detection_confidence, max_length=32),
             )
-        
-    
-    def _process_frame_with_detection(self, frame_numpy: np.ndarray, frame_metadata: Dict[str, Any]) -> List[Tuple[Image.Image, Dict[str, Any]]]:
+
+    def _process_frame_with_detection(
+        self, frame_numpy: np.ndarray, frame_metadata: Dict[str, Any]
+    ) -> List[Tuple[Image.Image, Dict[str, Any]]]:
         """
         Process a single frame and optionally detect objects to create crops.
 
@@ -661,15 +667,15 @@ class SimplePipelineManager:
         logger.info(
             "Processing %s frames with %s maximum parallel workers",
             sanitize_for_log(len(all_frames), max_length=32),
-            sanitize_for_log(self.config['pipeline_count'], max_length=32),
+            sanitize_for_log(self.config["pipeline_count"], max_length=32),
         )
-        
+
         if self.enable_object_detection:
             logger.info(
                 "Object detection enabled with confidence threshold: %s",
                 sanitize_for_log(self.detection_confidence, max_length=32),
             )
-        
+
         try:
             # Create batches of frames for parallel processing
             logger.info(
@@ -1094,12 +1100,12 @@ def generate_video_embedding_sdk(
     Returns:
         Dictionary containing processing results and timing information
     """
-    total_start_time = time.perf_counter()
+    total_start_time = now_us()
     logger.info(
         "Starting SDK video processing with frame_interval=%s",
         sanitize_for_log(frame_interval, max_length=32),
     )
-    
+
     try:
         # Get SDK client
         sdk_client = get_sdk_client()
@@ -1109,7 +1115,7 @@ def generate_video_embedding_sdk(
                 "Embedding model %s reports no image/video support; skipping video embedding pipeline",
                 sdk_client.model_id,
             )
-            total_time = time.perf_counter() - total_start_time
+            total_time = now_us() - total_start_time
             return {
                 "status": "skipped_no_image_support",
                 "stored_ids": [],
@@ -1142,14 +1148,14 @@ def generate_video_embedding_sdk(
             detection_confidence=detection_confidence,
         )
 
-        total_time = time.perf_counter() - total_start_time
+        total_time = now_us() - total_start_time
         logger.info(f"SDK video processing completed in {total_time:.3f}s")
 
         result["total_processing_time"] = total_time
         return result
 
     except Exception as e:
-        total_time = time.perf_counter() - total_start_time
+        total_time = now_us() - total_start_time
         logger.error(f"SDK video processing failed after {total_time:.3f}s: {e}")
         raise
 
@@ -1169,11 +1175,15 @@ def _process_video_from_memory_simple_pipeline(
     This is the main implementation that extracts frames from video in memory,
     generates embeddings in parallel, and stores them in bulk.
     """
-    method_start_time = time.perf_counter()
+    method_start_time = now_us()
 
     shutdown_event = shutdown_event or threading.Event()
     logger.info("Processing video using simple parallel pipeline....")
     try:
+
+        tracer = init_tracer(output_file="trace.json", enabled=True)
+        tracer.set_process_name("decode_detect_embed_store_pipeline")
+
         logger.info("Initializing shared memory pools for frames and detected crops...")
         shm_pool = SharedMemoryPool(max_blocks=1536, block_size=1920 * 1080 * 3)
         crop_pool = SharedMemoryPool(max_blocks=shm_pool.max_blocks, block_size=shm_pool.block_size)
@@ -1193,6 +1203,7 @@ def _process_video_from_memory_simple_pipeline(
             config,
             shm_pool=shm_pool,
             shutdown_event=shutdown_event,
+            tracer=tracer,
         )
         all_stream_metadata = extractor.get_metadata()
         logger.info(f"Extracted metadata for all streams: {all_stream_metadata}")
@@ -1228,19 +1239,20 @@ def _process_video_from_memory_simple_pipeline(
                 enable_object_detection,
                 detection_confidence,
                 shutdown_event,
+                tracer,
             ),
         )
 
         embed_sink_thread = threading.Thread(
             target=embed_store_worker,
             name="embed_store_worker",
-            args=(embed_sink_queue, result_queue, shm_pool, crop_pool, shutdown_event),
+            args=(embed_sink_queue, result_queue, shm_pool, crop_pool, shutdown_event, tracer),
         )
 
         result_thread = threading.Thread(
             target=process_result_worker,
             name="result_worker",
-            args=(result_queue, completion_queue, all_stream_metadata),
+            args=(result_queue, completion_queue, all_stream_metadata, tracer),
         )
 
         detection_thread.start()
@@ -1258,19 +1270,20 @@ def _process_video_from_memory_simple_pipeline(
         video_url = metadata_dict.get("video_url", "")
         video_rel_url = metadata_dict.get("video_rel_url", "")
 
-        all_stream_metadata[0].update({
-            "_video_id": video_id,
-            "_filename": filename,
-            "_bucket_name": bucket_name,
-            "_video_url": video_url,
-            "_video_rel_url": video_rel_url,
+        all_stream_metadata[0].update(
+            {
+                "_video_id": video_id,
+                "_filename": filename,
+                "_bucket_name": bucket_name,
+                "_video_url": video_url,
+                "_video_rel_url": video_rel_url,
             }
         )
         # Process batches in parallel - each batch will do optional object detection + embedding generation + immediate storage
         # total_embeddings_stored = 0
         total_stored_ids = 0
 
-        total_wall_time_start = time.perf_counter()
+        total_wall_time_start = now_us()
         # Assuming single video input; can be extended for multiple videos
         for i, (batch_frame_metadata, batch_times) in enumerate(extractor.decode_frames()):
             logger.info(f"Processing batch {i} of frames")
@@ -1343,7 +1356,7 @@ def _process_video_from_memory_simple_pipeline(
                 logger.error(f"Error processing frame {i}: {e.with_traceback(e.__traceback__)}")
                 raise
 
-        total_wall_time_elapsed = time.perf_counter() - total_wall_time_start
+        total_wall_time_elapsed = now_us() - total_wall_time_start
         logger.info(
             "Total wall time for frame extraction (total_frames_processed=%d) + embedding generation + storage of (total_stored_ids=%d) frames: %.3fs",
             total_frames_processed,
@@ -1380,7 +1393,7 @@ def _process_video_from_memory_simple_pipeline(
         total_detected_items = stream_stats.get("total_detected_crops", 0)
         total_stored_ids = stream_stats.get("total_stored_ids", 0)
 
-        stream_stats = stream_stats.get("stats_summary", {})
+        stream_stats = stream_stats.get("metrics", {})
         detect_stat = stream_stats.get("detect")
         embed_stat = stream_stats.get("embed")
         store_stat = stream_stats.get("store")
@@ -1433,7 +1446,6 @@ def _process_video_from_memory_simple_pipeline(
                         else 0.0
                     ),
                 },
-
             },
             "storage": {
                 "avg_s": store_stat.get("avg", 0.0),
@@ -1457,7 +1469,7 @@ def _process_video_from_memory_simple_pipeline(
             },
         }
         logger.info(f"Stage breakdown: {stage_breakdown}")
-        method_time = time.perf_counter() - method_start_time
+        method_time = now_us() - method_start_time
         pipeline_config = get_pipeline_config()
         result = {
             "status": "success",
@@ -1479,7 +1491,7 @@ def _process_video_from_memory_simple_pipeline(
             "processing_mode": "sdk_simple_pipeline_with_batch_storage",
             "batch_details": batch_details,
             "pipeline_config": pipeline_config,
-            "video_properties": video_properties
+            "video_properties": video_properties,
         }
 
         logger.info("Simple pipeline processing completed successfully")
@@ -1487,7 +1499,7 @@ def _process_video_from_memory_simple_pipeline(
         return result
 
     except Exception as e:
-        method_time = time.perf_counter() - method_start_time
+        method_time = now_us() - method_start_time
         shutdown_event.set()  # Ensure all workers are signaled to shut down on error
         logger.error(f"Simple pipeline processing failed after {method_time:.3f}s: {e}")
         raise
@@ -1636,22 +1648,28 @@ def allocate_detected_crops(
 
 
 def detection_worker(
-    detection_meta_queue,
-    embed_sink_queue,
-    crop_pool,
-    enable_object_detection,
-    detection_confidence,
-    shutdown_event,
+    detection_meta_queue: queue.Queue,
+    embed_sink_queue: queue.Queue,
+    crop_pool: SharedMemoryPool,
+    enable_object_detection: bool,
+    detection_confidence: float,
+    shutdown_event: threading.Event,
+    tracer: Tracer,
 ):
     thread_pool = ThreadPoolExecutor(max_workers=2)
     detector = get_global_detector(enable_object_detection, detection_confidence)
+
+    tid = threading.get_ident()
+
+    if tracer is not None and tracer.should_trace():
+        tracer.set_thread_name(tid=tid, name="detection_thread")
 
     while True:
         try:
             if shutdown_event.is_set():
                 logger.debug("[DETECTION WORKER] Shutdown event set, exiting.")
                 break
-
+            detection_time = now_us()
             batch = detection_meta_queue.get(timeout=1)
         except queue.Empty:
             logger.warning("[DETECTION QUEUE EMPTY] WAITING...")
@@ -1664,7 +1682,27 @@ def detection_worker(
         # If Object Detection is enabled, this will return detected crops metadata
         try:
             stats = batch.setdefault("stats", {})
-            detection_time = time.perf_counter()
+
+            stream_id = batch["stream_id"]
+            batch_id = batch["batch_id"]
+            batch_size = batch["batch_size"]
+
+            if tracer is not None and tracer.should_trace():
+                flow_id = f"s{stream_id}_b{batch_id}"
+
+                tracer.emit_complete(
+                    "detect_queue_wait",
+                    batch["enqueue_ts"],
+                    detection_time,
+                    tid=tid,
+                    cat="queue",
+                    args={
+                        "batch_id": batch_id,
+                        "stream_id": stream_id,
+                        "input_batch_size": batch_size,
+                    },
+                )
+                tracer.flow_step(flow_id, tid=tid, ts=detection_time)
 
             if enable_object_detection:
                 detected_crops_metadata = allocate_detected_crops(
@@ -1674,11 +1712,29 @@ def detection_worker(
 
             batch["total"] = len(batch["frames"])
 
-            detection_end_time = time.perf_counter()
+            ts1 = now_us()
+            if tracer.should_trace():
+                tracer.emit_complete(
+                    "detect",
+                    detection_time,
+                    ts1,
+                    tid,
+                    args={
+                        "batch_id": batch_id,
+                        "stream_id": stream_id,
+                        "input_batch_size": batch_size,
+                        "detected_crops": batch["total"] - batch_size,
+                        "total_batch_size": batch["total"],
+                    },
+                )
+
+            batch["enqueue_ts"] = ts1
+
+            detection_end_time = now_us()
             stats["detect"] = (
                 detection_time,
                 detection_end_time,
-                detection_end_time - detection_time,
+                (detection_end_time - detection_time) / 1000,
             )
 
             embed_sink_queue.put(batch)
@@ -1695,9 +1751,21 @@ def detection_worker(
     logger.info("Detection worker shutdown complete")
 
 
-def embed_store_worker(embed_sink_queue, result_queue, shm_pool, crop_pool, shutdown_event):
+def embed_store_worker(
+    embed_sink_queue: queue.Queue,
+    result_queue: queue.Queue,
+    shm_pool: SharedMemoryPool,
+    crop_pool: SharedMemoryPool,
+    shutdown_event: threading.Event,
+    tracer: Tracer,
+):
     thread_pool = ThreadPoolExecutor(max_workers=2)
     _sdk_client = get_sdk_client()
+
+    tid = threading.get_ident()
+
+    if tracer is not None and tracer.should_trace():
+        tracer.set_thread_name(tid=tid, name="embed_store_thread")
 
     while True:
         try:
@@ -1706,6 +1774,7 @@ def embed_store_worker(embed_sink_queue, result_queue, shm_pool, crop_pool, shut
                 break
 
             # Batch comprises of a list of full +/- detected crops metadata
+            ts_deq = now_us()
             batch = embed_sink_queue.get(timeout=1)
         except queue.Empty:
             if shutdown_event.is_set():
@@ -1720,47 +1789,145 @@ def embed_store_worker(embed_sink_queue, result_queue, shm_pool, crop_pool, shut
 
         try:
             stats = batch.setdefault("stats", {})
-            shm_map_time = time.perf_counter()
+            shm_map_time = now_us()
             frame_batch = list(thread_pool.map(_map_shared_frame, batch["frames"]))
             shm_handles, batch_frame_np, batch_frame_meta = tuple(map(list, zip(*frame_batch)))
-            shm_map_end_time = time.perf_counter() - shm_map_time
+            shm_map_end_time = now_us() - shm_map_time
 
             logger.info(
                 f"Mapped shared memory for {len(batch_frame_np)} frames in {shm_map_end_time:.3f}s, starting embedding generation..."
             )
 
-            embedding_time = time.perf_counter()
-            embedding, embedding_metrics = _sdk_client.generate_embeddings_for_images(batch_frame_np, metrics_out=True)
+            embedding_time = now_us()
 
-            embedding_end_time = time.perf_counter()
+            stream_id = batch["stream_id"]
+            batch_id = batch["batch_id"]
+            batch_size = batch["batch_size"]
+            flow_id = f"s{stream_id}_b{batch_id}"
+
+            if tracer is not None and tracer.should_trace():
+
+                tracer.emit_complete(
+                    "embed_store_queue_wait",
+                    batch["enqueue_ts"],
+                    ts_deq,
+                    tid=tid,
+                    cat="queue",
+                    args={
+                        "batch_id": batch_id,
+                        "stream_id": stream_id,
+                        "input_batch_size": batch_size,
+                    },
+                )
+
+                tracer.flow_step(flow_id, tid=tid, ts=ts_deq)
+
+            embedding, embedding_metrics = _sdk_client.generate_embeddings_for_images(
+                batch_frame_np, metrics_out=True
+            )
+
+            ts1 = now_us()
+            if tracer is not None and tracer.should_trace():
+                tracer.emit_complete(
+                    "embed",
+                    embedding_time,
+                    ts1,
+                    tid,
+                    cat="gpu",  # useful for visualization
+                    args={
+                        "batch_id": batch_id,
+                        "stream_id": stream_id,
+                        "total": batch["batch_size"],
+                        "embed_preprocess_time": embedding_metrics[0],
+                        "embed_infer_time": embedding_metrics[1],
+                    },
+                )
+
+            embedding_end_time = now_us()
             stats["embed"] = (
                 embedding_time,
                 embedding_end_time,
-                embedding_end_time - embedding_time,
+                (embedding_end_time - embedding_time) / 1000,
             )
 
             logger.debug(
                 f"[EMBED_WORKER] Worker generated embeddings for {len(embedding)} frames/crops in {(embedding_end_time - embedding_time):.3f}s, now storing embeddings..."
             )
 
-            storage_time = time.perf_counter()
+            storage_time = now_us()
+
+            if tracer.should_trace():
+                tracer.flow_step(flow_id, tid=tid, ts=storage_time)
+
             saved_ids = _sdk_client.store_frame_embeddings(embedding, batch_frame_meta)
-            storage_end_time = time.perf_counter()
-            stats["store"] = (storage_time, storage_end_time, storage_end_time - storage_time)
+
+            if tracer.should_trace():
+                ts1 = now_us()
+
+                tracer.emit_complete(
+                    "store",
+                    storage_time,
+                    ts1,
+                    tid,
+                    args={
+                        "batch_id": batch_id,
+                        "stream_id": stream_id,
+                        "total": batch["batch_size"],
+                    },
+                )
+
+                # end of pipeline
+                tracer.flow_end(flow_id, tid=tid, ts=ts1)
+
+            batch["enqueue_ts"] = ts1
+            storage_end_time = now_us()
+            stats["store"] = (
+                storage_time,
+                storage_end_time,
+                (storage_end_time - storage_time) / 1000,
+            )
 
             batch["stored_ids"] = saved_ids
             if embedding_metrics:
-                logger.debug(
-                    f"Embedding metrics for batch: {embedding_metrics}"
-                )
+                logger.debug(f"Embedding metrics for batch: {embedding_metrics}")
                 stats["embed_metrics"] = embedding_metrics
-            
-            stats["total"] = (
-                stats["decode"][2] + stats["detect"][2] + stats["embed"][2] + stats["store"][2]
-            )
 
             logger.info(
                 f"[EMBED_WORKER] Worker stored embeddings for {len(saved_ids)} frames/crops in {storage_end_time - storage_time:.3f}s"
+            )
+
+            stats["total"] = (
+                stats["decode"][2] + stats["detect"][2] + stats["embed"][2] + stats["store"][2]
+            )
+            
+            # Calculate Batch Level Metrics
+            metrics = batch.setdefault("metrics", {})
+
+            # Latency
+            metrics["e2e_batch_latency_ms"] = stats["store"][1] - stats["decode"][0]
+            metrics["decode_batch_latency_ms"] = stats["decode"][2] * 1000
+            metrics["detect_batch_latency_ms"] = stats["detect"][2] * 1000
+            metrics["embed_batch_latency_ms"] = stats["embed"][2] * 1000
+            metrics["store_batch_latency_ms"] = stats["store"][2] * 1000
+            metrics["raw_embed_preproc_batch_latency_ms"] = stats["embed_metrics"][0] * 1000
+            metrics["raw_embed_infer_batch_latency_ms"] = stats["embed_metrics"][1] * 1000
+
+            # Queue Wait times
+            metrics["decode_detect_queue_wait_ms"] = (
+                stats["detect"][1] - stats["decode"][2]
+            ) * 1000
+            metrics["detect_embed_queue_wait_ms"] = (stats["embed"][1] - stats["detect"][2]) * 1000
+
+            # Throughput
+            metrics["decode_batch_tput_fps"] = batch.get("batch_size", 0) / stats["decode"][2]
+            metrics["detect_batch_tput_fps"] = batch.get("batch_size", 0) / stats["detect"][2]
+            metrics["embed_batch_tput_fps"] = batch.get("total", 0) / stats["embed"][2]
+            metrics["store_batch_tput_fps"] = batch.get("total", 0) / stats["store"][2]
+            metrics["raw_embed_preproc_batch_tput_fps"] = (
+                batch.get("total", 0) / stats["embed_metrics"][0]
+            )
+            metrics["raw_embed_infer_batch_tput_fps"] = (
+                batch.get("total", 0) / stats["embed_metrics"][1]
             )
 
             result_queue.put(batch)
@@ -1818,7 +1985,8 @@ def save_batch_results(completed_batches, all_stream_metadata):
 
     # Summarize per stream stats if needed
     stream_stats = {}
-    for batch in completed_batches:
+
+    for index, batch in enumerate(completed_batches):
         stream_id = batch.get("stream_id", "unknown")
 
         if f"{stream_id}" not in stream_stats:
@@ -1834,11 +2002,23 @@ def save_batch_results(completed_batches, all_stream_metadata):
                     "decode": [],
                     "embed_preprocess_time": [],
                     "embed_inference_time": [],
+                    "pipeline_wall_start_s": float("inf"),
+                    "pipeline_wall_end_s": float("-inf"),
                     "total": [],
                 },
-                "stats_summary": {},
                 "stored_ids": [],
+                "metrics": {},
             }
+
+        if index == 0 or index == len(completed_batches) - 1:
+            stream_stats[f"{stream_id}"]["stats"]["pipeline_wall_start_s"] = min(
+                stream_stats[f"{stream_id}"]["stats"]["pipeline_wall_start_s"],
+                batch["stats"].get("decode", (0, 0, 0))[0],
+            )
+            stream_stats[f"{stream_id}"]["stats"]["pipeline_wall_end_s"] = max(
+                stream_stats[f"{stream_id}"]["stats"]["pipeline_wall_end_s"],
+                batch["stats"].get("store", (0, 0, 0))[1],
+            )
 
         stream_stats[f"{stream_id}"]["total_frames_processed"] += batch.get("batch_size", 0)
         stream_stats[f"{stream_id}"]["total_stored_ids"] += batch.get("total", 0)
@@ -1853,30 +2033,113 @@ def save_batch_results(completed_batches, all_stream_metadata):
         stream_stats[f"{stream_id}"]["stats"]["detect"].append(
             batch["stats"].get("detect", (0, 0, 0))[2]
         )
-        stream_stats[f"{stream_id}"]["stats"]["embed"].append(batch["stats"].get("embed", (0, 0, 0))[2])
-        stream_stats[f"{stream_id}"]["stats"]["embed_preprocess_time"].append(batch["stats"].get("embed_metrics", [0, 0])[0])
-        stream_stats[f"{stream_id}"]["stats"]["embed_inference_time"].append(batch["stats"].get("embed_metrics", [0, 0])[1])
-        stream_stats[f"{stream_id}"]["stats"]["store"].append(batch["stats"].get("store", (0, 0, 0))[2])
+        stream_stats[f"{stream_id}"]["stats"]["embed"].append(
+            batch["stats"].get("embed", (0, 0, 0))[2]
+        )
+        stream_stats[f"{stream_id}"]["stats"]["embed_preprocess_time"].append(
+            batch["stats"].get("embed_metrics", [0, 0])[0]
+        )
+        stream_stats[f"{stream_id}"]["stats"]["embed_inference_time"].append(
+            batch["stats"].get("embed_metrics", [0, 0])[1]
+        )
+        stream_stats[f"{stream_id}"]["stats"]["store"].append(
+            batch["stats"].get("store", (0, 0, 0))[2]
+        )
         stream_stats[f"{stream_id}"]["stats"]["total"].append(batch["stats"].get("total", 0.0))
 
     for k, v in stream_stats.items():
-        stream_stats[f"{k}"]["stats_summary"]["decode"] = _summarize_stage_times(v["stats"]["decode"])
-        stream_stats[f"{k}"]["stats_summary"]["detect"] = _summarize_stage_times(v["stats"]["detect"])
-        stream_stats[f"{k}"]["stats_summary"]["embed"] = _summarize_stage_times(v["stats"]["embed"])
-        stream_stats[f"{k}"]["stats_summary"]["store"] = _summarize_stage_times(v["stats"]["store"])
-        stream_stats[f"{k}"]["stats_summary"]["total"] = _summarize_stage_times(v["stats"]["total"])
-        stream_stats[f"{k}"]["stats_summary"]["embed_preprocess_time"] = _summarize_stage_times(v["stats"]["embed_preprocess_time"])
-        stream_stats[f"{k}"]["stats_summary"]["embed_inference_time"] = _summarize_stage_times(v["stats"]["embed_inference_time"])
+        stream_stats[f"{k}"]["metrics"]["decode"] = _summarize_stage_times(v["stats"]["decode"])
+
+        stream_stats[f"{k}"]["metrics"]["decode"]["throughput"] = (
+            v["total_frames_processed"] / stream_stats[f"{k}"]["metrics"]["decode"]["total"]
+        )
+
+        stream_stats[f"{k}"]["metrics"]["detect"] = _summarize_stage_times(v["stats"]["detect"])
+        stream_stats[f"{k}"]["metrics"]["detect"]["throughput"] = (
+            v["total_frames_processed"] / stream_stats[f"{k}"]["metrics"]["detect"]["total"]
+        )
+
+        stream_stats[f"{k}"]["metrics"]["embed"] = _summarize_stage_times(v["stats"]["embed"])
+        stream_stats[f"{k}"]["metrics"]["embed"]["throughput"] = (
+            v["total_stored_ids"] / stream_stats[f"{k}"]["metrics"]["embed"]["total"]
+        )
+
+        stream_stats[f"{k}"]["metrics"]["store"] = _summarize_stage_times(v["stats"]["store"])
+        stream_stats[f"{k}"]["metrics"]["store"]["throughput"] = (
+            v["total_stored_ids"] / stream_stats[f"{k}"]["metrics"]["store"]["total"]
+        )
+
+        stream_stats[f"{k}"]["metrics"]["total"] = _summarize_stage_times(v["stats"]["total"])
+
+        stream_stats[f"{k}"]["metrics"]["embed_preprocess_time"] = _summarize_stage_times(
+            v["stats"]["embed_preprocess_time"]
+        )
+        stream_stats[f"{k}"]["metrics"]["embed_preprocess_time"]["throughput"] = (
+            v["total_stored_ids"]
+            / stream_stats[f"{k}"]["metrics"]["embed_preprocess_time"]["total"]
+        )
+
+        stream_stats[f"{k}"]["metrics"]["embed_inference_time"] = _summarize_stage_times(
+            v["stats"]["embed_inference_time"]
+        )
+        stream_stats[f"{k}"]["metrics"]["embed_inference_time"]["throughput"] = (
+            v["total_stored_ids"] / stream_stats[f"{k}"]["metrics"]["embed_inference_time"]["total"]
+        )
+
+        pipeline_wall_duration = (
+            stream_stats[f"{k}"]["stats"]["pipeline_wall_end_s"]
+            - stream_stats[f"{k}"]["stats"]["pipeline_wall_start_s"]
+        )
+        stream_stats[f"{k}"]["metrics"]["pipeline_throughput_fps"] = (
+            stream_stats[f"{k}"]["total_frames_processed"] / pipeline_wall_duration
+        )
+
+        stream_stats[f"{k}"]["metrics"]["pipeline_throughput_fps_with_OD"] = (
+            stream_stats[f"{k}"]["total_stored_ids"] / pipeline_wall_duration
+        )
+
+        # Pipeline/concurrency efficiencies
+        # Total time taken by (decode, detect and embed+store / total wall duration)
+        # If pipeline_concurrency_factor results 2.5 means, 2.5 seconds worth of work done in 1 second due to concurrency.
+        # Higher is better, capped by number of threads.
+        stream_stats[f"{k}"]["pipeline_concurrency_factor"] = (
+            stream_stats[f"{k}"]["metrics"]["total"]["total"] / pipeline_wall_duration
+        )
+
+        # 3 concurrent threads (decode, detect, embed+store) in action.
+        stream_stats[f"{k}"]["pipeline_efficiency_pct"] = round(
+            (stream_stats[f"{k}"]["pipeline_concurrency_factor"] / 3) * 100, 3
+        )
+
+        stream_stats[f"{k}"]["parallel_efficiency_pct"] = round(max(
+            stream_stats[f"{k}"]["metrics"]["decode"]["total"],
+            stream_stats[f"{k}"]["metrics"]["detect"]["total"],
+            stream_stats[f"{k}"]["metrics"]["embed"]["total"],
+            stream_stats[f"{k}"]["metrics"]["store"]["total"],
+        ) * 100 / pipeline_wall_duration, 3)
+
+        stream_stats[f"{k}"]["decode_pipeline_efficiency_pct"] = (
+            stream_stats[f"{k}"]["metrics"]["decode"]["total"] / pipeline_wall_duration
+        )
+        stream_stats[f"{k}"]["detect_pipeline_efficiency_pct"] = (
+            stream_stats[f"{k}"]["metrics"]["detect"]["total"] / pipeline_wall_duration
+        )
+        stream_stats[f"{k}"]["embed_store_pipeline_efficiency_pct"] = (
+            stream_stats[f"{k}"]["metrics"]["embed"]["total"]
+            + stream_stats[f"{k}"]["metrics"]["store"]["total"]
+        ) / pipeline_wall_duration
 
     for k, _ in stream_stats.items():
-        stream_stats[f"{k}"]["video_metadata"] = all_stream_metadata[int(k)] if k.isdigit() and int(k) < len(all_stream_metadata) else {}
-    
+        stream_stats[f"{k}"]["video_metadata"] = (
+            all_stream_metadata[int(k)] if k.isdigit() and int(k) < len(all_stream_metadata) else {}
+        )
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    
+
     logger.info(f"Saving batch results for {len(completed_batches)} batches")
     with open(f"batch_stat_results_{timestamp}.json", "w") as f:
         json.dump(completed_batches, f, indent=2)
-        
+
     with open(f"stream_stats_results_{timestamp}.json", "w") as f:
         json.dump(stream_stats, f, indent=2)
 
@@ -1910,6 +2173,7 @@ def process_result_worker(result_queue, completion_queue, all_stream_metadata):
     completion_queue.put(result)
     logger.info("[RESULT WORKER] All batches processed, Result Saved!!!")
 
+
 def generate_rtsp_video_embedding_sdk(
     video_uris: list[str],
     metadata_dict: Dict[str, Any],
@@ -1932,7 +2196,7 @@ def generate_rtsp_video_embedding_sdk(
     Returns:
         Dictionary containing processing results and timing information
     """
-    total_start_time = time.perf_counter()
+    total_start_time = now_us()
     logger.info("ID of shutdown_event in generate_rtsp_video_embedding_sdk: %s", id(shutdown_event))
     try:
         # Get SDK client
@@ -1943,7 +2207,7 @@ def generate_rtsp_video_embedding_sdk(
                 "Embedding model %s reports no image/video support; skipping video embedding pipeline",
                 sdk_client.model_id,
             )
-            total_time = time.perf_counter() - total_start_time
+            total_time = now_us() - total_start_time
             return {
                 "status": "skipped_no_image_support",
                 "stored_ids": [],
@@ -1977,13 +2241,13 @@ def generate_rtsp_video_embedding_sdk(
             shutdown_event=shutdown_event,
         )
 
-        total_time = time.perf_counter() - total_start_time
+        total_time = now_us() - total_start_time
         logger.info(f"SDK video processing completed in {total_time:.3f}s")
 
         result["total_processing_time"] = total_time
         return result
 
     except Exception as e:
-        total_time = time.perf_counter() - total_start_time
+        total_time = now_us() - total_start_time
         logger.error(f"SDK video processing failed after {total_time:.3f}s: {e}")
         raise
