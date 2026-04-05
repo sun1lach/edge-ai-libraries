@@ -122,24 +122,46 @@ def _record_sdk_pipeline(
     sdk_result: Dict[str, Any],
 ) -> None:
     try:
-        stage_breakdown = sdk_result.get("timing", {}).get("stage_breakdown", {})
-        stage_detection = stage_breakdown.get("detection", {})
-        stage_embedding = stage_breakdown.get("embedding", {})
-        stage_storage = stage_breakdown.get("storage", {})
-        video_props = sdk_result.get("video_properties", {})
+        video_props = sdk_result.get("video_metadata", {})
 
         pipeline_stats = {
-            "frames_extracted": sdk_result.get("frame_counts", {}).get("extracted_frames", 0),
-            "items_after_detection": sdk_result.get("frame_counts", {}).get("post_detection_items", 0),
-            "embeddings_stored": len(sdk_result.get("stored_ids", [])),
-            "frame_extraction_seconds": sdk_result.get("timing", {}).get("frame_extraction_time", 0.0),
-            "detection_seconds": stage_detection.get("total_s", 0.0),
-            "embedding_seconds_total": stage_embedding.get("total_s", 0.0),
-            "embedding_preprocess_seconds_avg": stage_embedding.get("preprocess", {}).get("avg_s", 0.0),
-            "embedding_inference_seconds_avg": stage_embedding.get("inference", {}).get("avg_s", 0.0),
-            "storage_seconds_total": stage_storage.get("total_s", 0.0),
-            "total_wall_seconds": sdk_result.get("timing", {}).get("pipeline_wall_time", 0.0),
+            "properties":{
+                "stream_id": sdk_result.get("stream_id", -1),
+                "frames_extracted": sdk_result.get("total_frames_processed", 0),
+                "items_after_detection": sdk_result.get("total_detected_crops", 0),
+                "embeddings_stored": sdk_result.get("total_stored_ids", 0),
+            },
+            "stage_duration": {
+                "frame_extraction_seconds": sdk_result.get("metrics", {}).get("decode", {}).get("total", 0.0),
+                "detection_seconds": sdk_result.get("metrics", {}).get("detect", {}).get("total", 0.0),
+                "embedding_seconds_total": sdk_result.get("metrics", {}).get("embed", {}).get("total", 0.0),
+                "embed_preprocess_time": sdk_result.get("metrics", {}).get("embed_preprocess_time", {}).get("total", 0.0),
+                "embed_inference_time": sdk_result.get("metrics", {}).get("embed_inference_time", {}).get("total", 0.0),
+                "storage_seconds_total": sdk_result.get("metrics", {}).get("store", {}).get("total", 0.0),
+                "total_wall_seconds": sdk_result.get("metrics", {}).get("pipeline_wall_duration", 0.0),
+            },
             "batches": sdk_result.get("batch_details", []),
+            "pipeline_metrics": {
+                "pipeline_wall_duration": sdk_result.get("pipeline_wall_duration", -1),
+                "pipeline_throughput_fps": sdk_result.get("pipeline_throughput_fps", -1),
+                "pipeline_throughput_fps_with_OD": sdk_result.get("pipeline_throughput_fps_with_OD", -1),
+                "pipeline_concurrency_factor": sdk_result.get("pipeline_concurrency_factor", -1),
+                "pipeline_efficiency_pct": sdk_result.get("pipeline_efficiency_pct", -1),
+                "parallel_efficiency_pct": sdk_result.get("parallel_efficiency_pct", -1),
+                "decode_pipeline_efficiency_pct": sdk_result.get("decode_pipeline_efficiency_pct", -1),
+                "detect_pipeline_efficiency_pct": sdk_result.get("detect_pipeline_efficiency_pct", -1),
+                "embed_store_pipeline_efficiency_pct": sdk_result.get("embed_store_pipeline_efficiency_pct", -1),
+            },
+            "stage_throughput": {
+                "decode_throughput": sdk_result.get("metrics", {}).get("decode", {}).get("throughput", 0.0),
+                "embedding_infer_throughput": sdk_result.get("metrics", {}).get("embed_inference_time", {}).get("throughput", 0.0),
+                "embedding_preproc_throughput": sdk_result.get("metrics", {}).get("embed_preprocess_time", {}).get("throughput", 0.0),
+                "embeddings_throughput": sdk_result.get("metrics", {}).get("embed", {}).get("throughput", 0.0),
+                "pipeline_throughput": sdk_result.get("pipeline_throughput_fps", 0.0),
+                "pipeline_throughput_with_od": sdk_result.get("pipeline_throughput_fps_with_OD", 0.0),
+                "store_throughput": sdk_result.get("metrics", {}).get("store", {}).get("throughput", 0.0),
+                "detect_throughput": sdk_result.get("metrics", {}).get("detect", {}).get("throughput", 0.0),
+            }
         }
 
         video_metadata = _prepare_video_metadata_payload(
@@ -475,19 +497,29 @@ async def generate_video_embedding_from_content(
             "SDK processing completed: %s frames processed",
             sanitize_for_log(results['total_frames_processed'], max_length=32),
         )
-        _record_sdk_pipeline(
-            context=telemetry_context,
-            bucket_name=bucket_name,
-            video_id=video_id,
-            filename=filename,
-            frame_interval=frame_interval,
-            tags=tags,
-            enable_object_detection=enable_object_detection,
-            detection_confidence=detection_confidence,
-            metadata_dict=metadata_dict,
-            sdk_result=results,
-        )
-        return results['stored_ids']
+        stored_ids = []
+        for stream_id, stream_result in results.items():
+
+            bucket_name = stream_result["video_metadata"]["_bucket_name"]
+            video_id = stream_result["video_metadata"]["_video_id"]
+            filename = stream_result["video_metadata"]["_filename"]
+
+            _record_sdk_pipeline(
+                context=telemetry_context,
+                bucket_name=bucket_name,
+                video_id=video_id,
+                filename=filename,
+                frame_interval=frame_interval,
+                tags=tags,
+                enable_object_detection=enable_object_detection,
+                detection_confidence=detection_confidence,
+                metadata_dict=metadata_dict,
+                sdk_result=stream_result,
+            )
+
+            stored_ids.extend(stream_result['stored_ids'])
+
+        return stored_ids
 
     except Exception as ex:
         logger.error(f"Error in SDK video embedding from content: {ex}")

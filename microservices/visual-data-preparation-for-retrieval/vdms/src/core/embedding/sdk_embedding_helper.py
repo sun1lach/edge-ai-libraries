@@ -2006,10 +2006,12 @@ def save_batch_results(completed_batches, all_stream_metadata):
                     "pipeline_wall_end_s": float("-inf"),
                     "total": [],
                 },
+                "batch_details": [],
                 "stored_ids": [],
                 "metrics": {},
             }
 
+        stream_stats[f"{stream_id}"]["batch_details"].append(batch)
         if index == 0 or index == len(completed_batches) - 1:
             stream_stats[f"{stream_id}"]["stats"]["pipeline_wall_start_s"] = min(
                 stream_stats[f"{stream_id}"]["stats"]["pipeline_wall_start_s"],
@@ -2090,11 +2092,12 @@ def save_batch_results(completed_batches, all_stream_metadata):
             stream_stats[f"{k}"]["stats"]["pipeline_wall_end_s"]
             - stream_stats[f"{k}"]["stats"]["pipeline_wall_start_s"]
         )
-        stream_stats[f"{k}"]["metrics"]["pipeline_throughput_fps"] = (
+        stream_stats[f"{k}"]["pipeline_wall_duration"] = pipeline_wall_duration
+        stream_stats[f"{k}"]["pipeline_throughput_fps"] = (
             stream_stats[f"{k}"]["total_frames_processed"] / pipeline_wall_duration
         )
 
-        stream_stats[f"{k}"]["metrics"]["pipeline_throughput_fps_with_OD"] = (
+        stream_stats[f"{k}"]["pipeline_throughput_fps_with_OD"] = (
             stream_stats[f"{k}"]["total_stored_ids"] / pipeline_wall_duration
         )
 
@@ -2128,6 +2131,7 @@ def save_batch_results(completed_batches, all_stream_metadata):
             stream_stats[f"{k}"]["metrics"]["embed"]["total"]
             + stream_stats[f"{k}"]["metrics"]["store"]["total"]
         ) / pipeline_wall_duration
+
 
     for k, _ in stream_stats.items():
         stream_stats[f"{k}"]["video_metadata"] = (
@@ -2166,10 +2170,13 @@ def process_result_worker(result_queue, completion_queue, all_stream_metadata):
     result = {
         "status": "success",
         "completed_batches": len(completed_batches),
-        "batch_details": completed_batches,
+        # "batch_details": completed_batches,
         "stream_stats": stream_stats,
         "video_metadata": all_stream_metadata,
     }
+
+    stream_stats["batch_details"] = completed_batches
+
     completion_queue.put(result)
     logger.info("[RESULT WORKER] All batches processed, Result Saved!!!")
 

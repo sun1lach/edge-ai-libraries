@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from enum import Enum
-from typing import Annotated, List, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -192,12 +192,14 @@ class TelemetryStageTiming(BaseModel):
 
 class TelemetryBatchDetail(BaseModel):
     """Timing details for a single batch in SDK mode."""
-
+    stream_id: int = Field(ge=0)
     batch_index: int = Field(ge=1)
     input_frames: int = Field(ge=0)
     items_after_detection: int = Field(ge=0)
     detection_seconds: float = Field(ge=0.0)
     embedding_seconds: float = Field(ge=0.0)
+    embedding_preproc_seconds: float = Field(ge=0.0)
+    embedding_infer_seconds: float = Field(ge=0.0)
     storage_seconds: float = Field(ge=0.0)
     total_seconds: float = Field(ge=0.0)
     embeddings_stored: int = Field(ge=0)
@@ -214,10 +216,15 @@ class TelemetryCounts(BaseModel):
 class TelemetryThroughput(BaseModel):
     """Derived throughput metrics."""
 
-    embeddings_per_second: float = Field(ge=0.0)
-    embedding_stage_embeddings_per_second: float = Field(ge=0.0)
-    wall_time_embeddings_per_second: float = Field(ge=0.0)
-    frames_per_second: float = Field(ge=0.0)
+    decode_throughput: float = Field(ge=0.0)
+    detect_throughput: float = Field(ge=0.0)
+    embeddings_throughput: float = Field(ge=0.0)
+    store_throughput: float = Field(ge=0.0)
+    embedding_preproc_throughput: float = Field(ge=0.0)
+    embedding_infer_throughput: float = Field(ge=0.0)
+    pipeline_throughput: float = Field(ge=0.0)
+    pipeline_throughput_with_od: float = Field(ge=0.0)
+
 
 
 class TelemetryVideoMetadata(BaseModel):
@@ -264,8 +271,9 @@ class TelemetryRecord(BaseModel):
     video: TelemetryVideoMetadata
     config: TelemetryProcessingConfig
     counts: TelemetryCounts
-    stages: List[TelemetryStageTiming]
-    throughput: TelemetryThroughput
+    pipeline_stats: Dict[str, Any] = Field(default_factory=dict)
+    stage_duration: Dict[str, Any] = Field(default_factory=dict)
+    stage_throughput: Dict[str, Any] = Field(default_factory=dict)
     batches: List[TelemetryBatchDetail] = Field(default_factory=list)
 
 
