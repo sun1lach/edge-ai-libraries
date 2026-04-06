@@ -1115,7 +1115,7 @@ def generate_video_embedding_sdk(
                 "Embedding model %s reports no image/video support; skipping video embedding pipeline",
                 sdk_client.model_id,
             )
-            total_time = now_us() - total_start_time
+            total_time = (now_us() - total_start_time) / 1_000_000
             return {
                 "status": "skipped_no_image_support",
                 "stored_ids": [],
@@ -1148,14 +1148,14 @@ def generate_video_embedding_sdk(
             detection_confidence=detection_confidence,
         )
 
-        total_time = (now_us() - total_start_time) / 1_000_00
+        total_time = (now_us() - total_start_time) / 1_000_000
         logger.info(f"SDK video processing completed in {total_time:.3f}s")
 
         # result["total_processing_time"] = total_time
         return result
 
     except Exception as e:
-        total_time = (now_us() - total_start_time) / 1_000_00
+        total_time = (now_us() - total_start_time) / 1_000_000
         logger.error(f"SDK video processing failed after {total_time:.3f}s: {e}")
         raise
 
@@ -1180,8 +1180,8 @@ def _process_video_from_memory_simple_pipeline(
     shutdown_event = shutdown_event or threading.Event()
     logger.info("Processing video using simple parallel pipeline....")
     try:
-
-        tracer = init_tracer(output_file="newtrace.json", enabled=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        tracer = init_tracer(output_file=f"trace_{timestamp}.json", enabled=True)
         tracer.set_process_name("decode_detect_embed_store_pipeline")
 
         logger.info("Initializing shared memory pools for frames and detected crops...")
@@ -1672,8 +1672,8 @@ def detection_worker(
             if shutdown_event.is_set():
                 logger.debug("[DETECTION WORKER] Shutdown event set, exiting.")
                 break
-            detection_time = now_us()
             batch = detection_meta_queue.get(timeout=1)
+            detection_time = now_us()
         except queue.Empty:
             logger.warning("[DETECTION QUEUE EMPTY] WAITING...")
             continue
@@ -1777,8 +1777,8 @@ def embed_store_worker(
                 break
 
             # Batch comprises of a list of full +/- detected crops metadata
-            ts_deq = now_us()
             batch = embed_sink_queue.get(timeout=1)
+            ts_deq = now_us()
         except queue.Empty:
             if shutdown_event.is_set():
                 logger.debug("[EMBED_WORKER] Shutdown event set, exiting.")
@@ -1795,7 +1795,7 @@ def embed_store_worker(
             shm_map_time = now_us()
             frame_batch = list(thread_pool.map(_map_shared_frame, batch["frames"]))
             shm_handles, batch_frame_np, batch_frame_meta = tuple(map(list, zip(*frame_batch)))
-            shm_map_end_time = now_us() - shm_map_time
+            shm_map_end_time = (now_us() - shm_map_time) / 1_000_000
 
             logger.info(
                 f"Mapped shared memory for {len(batch_frame_np)} frames in {shm_map_end_time:.3f}s, starting embedding generation..."
@@ -1864,9 +1864,8 @@ def embed_store_worker(
 
             saved_ids = _sdk_client.store_frame_embeddings(embedding, batch_frame_meta)
 
+            ts1 = now_us()
             if tracer.should_trace():
-                ts1 = now_us()
-
                 tracer.emit_complete(
                     "store",
                     storage_time,
@@ -1896,7 +1895,7 @@ def embed_store_worker(
                 stats["embed_metrics"] = embedding_metrics
 
             logger.info(
-                f"[EMBED_WORKER] Worker stored embeddings for {len(saved_ids)} frames/crops in {storage_end_time - storage_time:.3f}s"
+                f"[EMBED_WORKER] Worker stored embeddings for {len(saved_ids)} frames/crops in {(storage_end_time - storage_time) / 1_000_000}s"
             )
 
             stats["total"] = (
@@ -2057,8 +2056,12 @@ def save_batch_results(completed_batches, all_stream_metadata):
         stream_stats[f"{stream_id}"]["stats"]["total"].append(batch["stats"].get("total", 0.0))
 
         # metrics
-        stream_stats[f"{stream_id}"]["decode_detect_queue_wait_s"] += batch["metrics"].get("decode_detect_queue_wait_s", 0.0)
-        stream_stats[f"{stream_id}"]["detect_embed_queue_wait_s"] += batch["metrics"].get("detect_embed_queue_wait_s", 0.0)
+        stream_stats[f"{stream_id}"]["decode_detect_queue_wait_s"] += batch["metrics"].get(
+            "decode_detect_queue_wait_s", 0.0
+        )
+        stream_stats[f"{stream_id}"]["detect_embed_queue_wait_s"] += batch["metrics"].get(
+            "detect_embed_queue_wait_s", 0.0
+        )
 
     for k, v in stream_stats.items():
         stream_stats[f"{k}"]["metrics"]["decode"] = _summarize_stage_times(v["stats"]["decode"])
@@ -2221,7 +2224,7 @@ def generate_rtsp_video_embedding_sdk(
                 "Embedding model %s reports no image/video support; skipping video embedding pipeline",
                 sdk_client.model_id,
             )
-            total_time = now_us() - total_start_time
+            total_time = (now_us() - total_start_time) / 1_000_000
             return {
                 "status": "skipped_no_image_support",
                 "stored_ids": [],
@@ -2258,7 +2261,7 @@ def generate_rtsp_video_embedding_sdk(
         total_time = (now_us() - total_start_time) / 1_000_000
         logger.info(f"SDK video processing completed in {total_time:.3f}s")
 
-        result["total_processing_time"] = total_time
+        # result["total_processing_time"] = total_time
         return result
 
     except Exception as e:

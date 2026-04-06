@@ -11,9 +11,6 @@ def now_us():
     return _now() // 1000
 
 
-_tls = local()
-
-
 class Tracer:
     def __init__(
         self,
@@ -28,7 +25,6 @@ class Tracer:
         self.pid = pid
         self.enabled = enabled
         self.sample_rate = max(1, sample_rate)
-
         self.buffer_size = buffer_size
         self.flush_interval = flush_interval
 
@@ -50,9 +46,8 @@ class Tracer:
         if not self.enabled:
             return
         
-        # flush thread-local buffers BEFORE stopping
         buf = self._get_buffer()
-        if buf:
+        if len(buf) > 0:
             self._commit(buf[:])
             buf.clear()
 
@@ -83,11 +78,7 @@ class Tracer:
         os.replace(tmp_file, self.output_file)
 
     def _get_buffer(self):
-        buf = getattr(_tls, "buf", None)
-        if buf is None:
-            buf = []
-            _tls.buf = buf
-        return buf
+        return self._global_buffer
 
     def _commit(self, events):
         with self._lock:
@@ -106,8 +97,8 @@ class Tracer:
             data = self._global_buffer
             self._global_buffer = []
 
-        print("Output tracer file path")
-        print(self.output_file)
+        # print("Output tracer file path")
+        # print(self.output_file)
         mode = "a" if os.path.exists(self.output_file) else "w"
         with open(self.output_file, mode) as f:
             f.writelines(json.dumps(e) + "\n" for e in data)
@@ -125,6 +116,7 @@ class Tracer:
         buf.append(event)
 
         if len(buf) >= self.buffer_size:
+            # print(f"full commit buffer {len(buf)}")
             self._commit(buf[:])
             buf.clear()
 

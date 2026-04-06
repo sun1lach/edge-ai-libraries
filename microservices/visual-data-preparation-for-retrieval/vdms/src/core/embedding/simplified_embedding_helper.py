@@ -171,7 +171,7 @@ def _record_sdk_pipeline(
             },
             "batches": sdk_result.get("batch_details", []),
             "pipeline_metrics": {
-                "pipeline_wall_duration": sdk_result.get("pipeline_wall_duration", -1),
+                "pipeline_wall_duration": sdk_result.get("pipeline_wall_duration_s", -1),
                 "pipeline_throughput_fps": sdk_result.get("pipeline_throughput_fps", -1),
                 "pipeline_throughput_fps_with_OD": sdk_result.get(
                     "pipeline_throughput_fps_with_OD", -1
