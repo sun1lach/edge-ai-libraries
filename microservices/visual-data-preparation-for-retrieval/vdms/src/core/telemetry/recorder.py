@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import traceback
 from typing import Any, Dict, Iterable, List, Optional
 
 from src.common import logger
@@ -86,6 +87,7 @@ def _build_stage_timings(
 def _convert_batches(raw_batches: Iterable[Dict[str, Any]]) -> List[TelemetryBatchDetail]:
 	details: List[TelemetryBatchDetail] = []
 	for idx, batch in enumerate(raw_batches, start=1):
+		# print(batch)
 		details.append(
 			TelemetryBatchDetail(
 				stream_id=batch.get("stream_id", -1),
@@ -97,7 +99,7 @@ def _convert_batches(raw_batches: Iterable[Dict[str, Any]]) -> List[TelemetryBat
 				embedding_preproc_seconds=float(batch.get("stats", {}).get("embed_metrics")[0]),
 				embedding_infer_seconds=float(batch.get("stats", {}).get("embed_metrics")[1]),
 				storage_seconds=float(batch.get("stats", {}).get("store")[2]),
-				total_seconds=float(batch.get("stats", {}).get("total")[2]),
+				total_seconds=float(batch.get("stats", {}).get("total")),
 				embeddings_stored=int(batch.get("total", 0)),
 			)
 		)
@@ -115,6 +117,7 @@ def record_video_telemetry(
 
 	try:
 		total_wall = float(pipeline_stats.get("stage_duration", {}).get("total_wall_seconds", 0.0))
+		stream_id = int(pipeline_stats.get("properties", {}).get("stream_id", 0))
 		frame_count = int(pipeline_stats.get("properties", {}).get("frames_extracted", 0))
 		items_after_detection = int(pipeline_stats.get("properties", {}).get("items_after_detection", 0))
 		embeddings_stored = int(pipeline_stats.get("properties", {}).get("embeddings_stored", 0))
@@ -123,6 +126,7 @@ def record_video_telemetry(
 		del pipeline_stats["batches"]
 
 		counts = TelemetryCounts(
+			stream_id=stream_id,
 			frames_extracted=frame_count,
 			items_after_detection=items_after_detection,
 			embeddings_stored=embeddings_stored,
@@ -174,6 +178,8 @@ def record_video_telemetry(
 		return record
 	except Exception as exc:  # pragma: no cover - telemetry must not break pipeline
 		logger.warning("Failed to record telemetry: %s", exc)
+		tb = traceback.print_exc()
+		print(tb)
 		return None
 
 

@@ -49,6 +49,13 @@ class Tracer:
     def stop(self):
         if not self.enabled:
             return
+        
+        # flush thread-local buffers BEFORE stopping
+        buf = self._get_buffer()
+        if buf:
+            self._commit(buf[:])
+            buf.clear()
+
         self._running = False
         self._writer_thread.join()
         self._flush(final=True)
@@ -99,6 +106,8 @@ class Tracer:
             data = self._global_buffer
             self._global_buffer = []
 
+        print("Output tracer file path")
+        print(self.output_file)
         mode = "a" if os.path.exists(self.output_file) else "w"
         with open(self.output_file, mode) as f:
             f.writelines(json.dumps(e) + "\n" for e in data)
@@ -111,6 +120,8 @@ class Tracer:
             return
 
         buf = self._get_buffer()
+        print("Appending to buf event:")
+        print(event)
         buf.append(event)
 
         if len(buf) >= self.buffer_size:

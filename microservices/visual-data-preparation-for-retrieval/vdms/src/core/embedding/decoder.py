@@ -274,7 +274,7 @@ def decode_stream_and_batch_generator(
                 if shutdown_event and shutdown_event.is_set():
                     end_time = now_us()
                     logger.debug(f"Stream {stream_id} stopped by shutdown event during decoding")
-                    yield (INTERRUPT, stream_id, (start_time, end_time, end_time - start_time))
+                    yield (INTERRUPT, stream_id, (start_time, end_time, (end_time - start_time) / 1_000_000))
                     break
 
                 if packet.dts is None:
@@ -293,7 +293,7 @@ def decode_stream_and_batch_generator(
                         logger.debug(
                             f"Stream {stream_id} stopped by shutdown event during decoding"
                         )
-                        yield (INTERRUPT, stream_id, (start_time, end_time, end_time - start_time))
+                        yield (INTERRUPT, stream_id, (start_time, end_time, (end_time - start_time) / 1_000_000))
                         break
 
                     if global_frame_idx % stream_config.frame_interval != 0:
@@ -328,7 +328,7 @@ def decode_stream_and_batch_generator(
                         yield flush_batch(batch, batch_id), (
                             batch_start_time,
                             now_us(),
-                            now_us() - batch_start_time,
+                            (now_us() - batch_start_time) / 1_000_000,
                         )
                         batch_start_time = now_us()
                         batch.clear()
@@ -359,7 +359,7 @@ def decode_stream_and_batch_generator(
                 yield flush_batch(batch, batch_id), (
                     batch_start_time,
                     now_us(),
-                    now_us() - batch_start_time,
+                    (now_us() - batch_start_time) / 1_000_000,
                 )
                 batch_start_time = now_us()
                 batch.clear()
@@ -367,7 +367,7 @@ def decode_stream_and_batch_generator(
             yield (
                 DONE,
                 stream_id,
-                (start_time, end_time, end_time - start_time),
+                (start_time, end_time, (end_time - start_time) / 1_000_000),
             )
 
         finally:
@@ -410,7 +410,7 @@ def decode_and_batch_generator(
             if shutdown_event and shutdown_event.is_set():
                 logger.debug(f"Stream {stream_id} stopped by shutdown event during decoding")
                 end_time = now_us()
-                yield (INTERRUPT, stream_id, (start_time, end_time, end_time - start_time))
+                yield (INTERRUPT, stream_id, (start_time, end_time, (end_time - start_time) / 1_000_000))
                 break
 
             if frame_id % stream_config.frame_interval != 0:
@@ -452,7 +452,7 @@ def decode_and_batch_generator(
                 ).to_dict(), (
                     batch_start_time,
                     now_us(),
-                    (now_us() - batch_start_time) / 1000,
+                    (now_us() - batch_start_time) / 1_000_000,
                 )
 
                 batch = []
@@ -492,7 +492,7 @@ def decode_and_batch_generator(
             ).to_dict(), (
                 batch_start_time,
                 now_us(),
-                (now_us() - batch_start_time) / 1000,
+                (now_us() - batch_start_time) / 1_000_000,
             )
             batch_start_time = now_us()
 
@@ -501,7 +501,7 @@ def decode_and_batch_generator(
         yield (
             DONE,
             stream_id,
-            (start_time, end_time, (end_time - start_time) / 1000),
+            (start_time, end_time, (end_time - start_time) / 1_000_000),
         )
 
 
@@ -779,4 +779,4 @@ def extract_batched_frames(
 
     extractor = VideoFrameExtractor(video_inputs, config, shm_pool=shm_pool)
     logger.debug(f"[DECODER] Extractor metadata: {extractor.metadata_list}")
-    yield from extractor.decode_frames(tracer=None)
+    yield from extractor.decode_frames()

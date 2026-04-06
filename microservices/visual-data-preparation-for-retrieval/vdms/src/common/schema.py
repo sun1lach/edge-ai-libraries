@@ -193,7 +193,7 @@ class TelemetryStageTiming(BaseModel):
 class TelemetryBatchDetail(BaseModel):
     """Timing details for a single batch in SDK mode."""
     stream_id: int = Field(ge=0)
-    batch_index: int = Field(ge=1)
+    batch_index: int = Field(ge=0)
     input_frames: int = Field(ge=0)
     items_after_detection: int = Field(ge=0)
     detection_seconds: float = Field(ge=0.0)
@@ -207,7 +207,7 @@ class TelemetryBatchDetail(BaseModel):
 
 class TelemetryCounts(BaseModel):
     """Aggregate frame and embedding counts."""
-
+    stream_id: int = Field(ge=0)
     frames_extracted: int = Field(ge=0)
     items_after_detection: int = Field(ge=0)
     embeddings_stored: int = Field(ge=0)
