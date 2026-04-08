@@ -111,8 +111,6 @@ class Tracer:
             return
 
         buf = self._get_buffer()
-        print("Appending to buf event:")
-        print(event)
         buf.append(event)
 
         if len(buf) >= self.buffer_size:

@@ -1,4 +1,4 @@
-# Copyright (C) 2025 Intel Corporation
+# Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -18,6 +18,7 @@ The implementation includes support for OpenVINO optimization to improve inferen
 performance on Intel hardware.
 """
 from pathlib import Path
+from PIL import Image
 from typing import List, Union, Dict, Any, Optional
 import time
 import numpy as np
@@ -80,9 +81,9 @@ class CLIPHandler(BaseEmbeddingModel):
         self._embedding_dim: Optional[int] = None
         infer_batch_size = model_config.get("infer_batch_size", 64)
         self.preprocess_shape = (infer_batch_size, 3, 224, 224)  # Default shape for CLIP image encoder input
-        self._preprocess_workers = model_config.get("preprocess_workers", min(8, (os.cpu_count() or 4) * 2))
+        self._preprocess_workers = model_config.get("preprocess_workers", min(16, (os.cpu_count() or 4) * 2))
         self.async_infer = None
-        self.parallel_preprocessor = None
+        self.parallel_preprocessor: Optional[ParallelImagePreprocessor] = None
         
     def load_model(self) -> None:
         """
@@ -161,7 +162,8 @@ class CLIPHandler(BaseEmbeddingModel):
         )
         self.parallel_preprocessor = ParallelImagePreprocessor(
             preprocess_fn=self.preprocess,
-            max_workers=self._preprocess_workers
+            max_workers=self._preprocess_workers,
+            preprocess_shape=self.preprocess_shape
         )
         embedding_dim = int(self.ov_image_encoder.output().get_partial_shape()[-1].to_string())
         logger.info(f"DIMENSION OF IMAGE ENCODER OUTPUT: {embedding_dim}")
@@ -211,7 +213,7 @@ class CLIPHandler(BaseEmbeddingModel):
         text_features = F.normalize(text_features, dim=-1)
         return text_features
     
-    def encode_image(self, images: Union[np.ndarray, List[np.ndarray], torch.Tensor], metrics_out: bool = False) -> Union[Dict[str, Any], torch.Tensor]:
+    def encode_image(self, images: Union[Image.Image, List[Image.Image]], metrics_out: bool = False) -> Union[Dict[str, Any], torch.Tensor]:
         """
         Generate embeddings for a batch of images using CLIP image encoder with OpenVINO optimization.
         
@@ -225,15 +227,15 @@ class CLIPHandler(BaseEmbeddingModel):
             Normalized image embeddings with shape [1, embedding_dim] for single image
             or [batch_size, embedding_dim] for multiple images
         """
-        if isinstance(images, np.ndarray):
+        if isinstance(images, Image.Image):
             images = [images]
 
         logger.info(f"====AsyncInferQueue====")
         pre_process_start = time.perf_counter()
-        images = self.parallel_preprocessor.preprocess_images(images)
+        pre_processed_images = self.parallel_preprocessor.preprocess_images(images)
         preprocess_end = time.perf_counter()
         infer_start = time.perf_counter()
-        embeddings = self.async_infer.infer(images)
+        embeddings = self.async_infer.infer(pre_processed_images)
         infer_end = time.perf_counter()
         logger.info(f"Inference time for batch of {len(images)} images: {infer_end - infer_start:.4f} seconds")
         if metrics_out:
@@ -245,6 +247,7 @@ class CLIPHandler(BaseEmbeddingModel):
                 "processed_images": len(images)
             }
         return embeddings
+
     def convert_to_openvino(self, ov_models_dir: str, model=None, tokenizer=None) -> tuple:
         """Convert CLIP model to OpenVINO format using Optimum Intel for robust conversion."""
         ov_models_path = Path(ov_models_dir)

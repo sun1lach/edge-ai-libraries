@@ -172,8 +172,8 @@ def _record_sdk_pipeline(
             "batches": sdk_result.get("batch_details", []),
             "pipeline_metrics": {
                 "pipeline_wall_duration": sdk_result.get("pipeline_wall_duration_s", -1),
-                "pipeline_throughput_fps": sdk_result.get("pipeline_throughput_fps", -1),
-                "pipeline_throughput_fps_with_OD": sdk_result.get(
+                # "pipeline_throughput_fps": sdk_result.get("pipeline_throughput_fps", -1),
+                "pipeline_throughput_fps": sdk_result.get(
                     "pipeline_throughput_fps_with_OD", -1
                 ),
                 "pipeline_concurrency_factor": sdk_result.get("pipeline_concurrency_factor", -1),
@@ -202,8 +202,8 @@ def _record_sdk_pipeline(
                 "embeddings_throughput": sdk_result.get("metrics", {})
                 .get("embed", {})
                 .get("throughput", 0.0),
-                "pipeline_throughput": sdk_result.get("pipeline_throughput_fps", 0.0),
-                "pipeline_throughput_with_od": sdk_result.get(
+                # "pipeline_throughput": sdk_result.get("pipeline_throughput_fps", 0.0),
+                "pipeline_throughput": sdk_result.get(
                     "pipeline_throughput_fps_with_OD", 0.0
                 ),
                 "store_throughput": sdk_result.get("metrics", {})
@@ -576,7 +576,7 @@ async def generate_video_embedding_from_content(
             )
 
             logger.info(
-                f"SDK processing stream {stream_id} completed: {sanitize_for_log(stream_result['total_frames_processed'], max_length=32)} frames processed",
+                f"SDK processing from content | Stream ID: {stream_id} completed. {sanitize_for_log(stream_result['total_frames_processed'], max_length=32)} frames processed",
             )
 
             stored_ids.extend(stream_result["stored_ids"])
@@ -585,8 +585,6 @@ async def generate_video_embedding_from_content(
 
     except Exception as ex:
         logger.error(f"Error in SDK video embedding from content: {ex}")
-        tb = traceback.print_exc()
-        print(tb)
         raise
 
 
@@ -800,23 +798,33 @@ async def _generate_video_embedding_sdk_mode(
         detection_confidence=detection_confidence,
     )
 
-    logger.info(
-        "SDK processing completed: %s frames processed",
-        sanitize_for_log(results["total_frames_processed"], max_length=32),
-    )
-    _record_sdk_pipeline(
-        context=telemetry_context or {},
-        bucket_name=bucket_name,
-        video_id=video_id,
-        filename=filename,
-        frame_interval=frame_interval,
-        tags=tags,
-        enable_object_detection=enable_object_detection,
-        detection_confidence=detection_confidence,
-        metadata_dict=metadata_dict,
-        sdk_result=results,
-    )
-    return results["stored_ids"]
+    stored_ids = []
+    for stream_id, stream_result in results.items():
+
+        bucket_name = stream_result["video_metadata"]["_bucket_name"]
+        video_id = stream_result["video_metadata"]["_video_id"]
+        filename = stream_result["video_metadata"]["_filename"]
+
+        _record_sdk_pipeline(
+            context=telemetry_context or {},
+            bucket_name=bucket_name,
+            video_id=video_id,
+            filename=filename,
+            frame_interval=frame_interval,
+            tags=tags,
+            enable_object_detection=enable_object_detection,
+            detection_confidence=detection_confidence,
+            metadata_dict=metadata_dict,
+            sdk_result=stream_result,
+        )
+
+        logger.info(
+            f"SDK Mode processing | Stream ID: {stream_id} completed. {sanitize_for_log(stream_result['total_frames_processed'], max_length=32)} frames processed",
+        )
+
+        stored_ids.extend(stream_result["stored_ids"])
+
+    return stored_ids
 
 
 async def generate_text_embedding(

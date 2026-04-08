@@ -59,11 +59,13 @@ class ParallelImagePreprocessor:
         self,
         preprocess_fn: Callable[[Image.Image], np.ndarray],
         max_workers: Optional[int] = None,
+        preprocess_shape: tuple = (224, 224, 3),
         batch_size: int = 64,
     ):
         self.preprocess_fn = preprocess_fn
         self.max_workers = max_workers
         self.batch_size = batch_size
+        self.preprocess_shape = preprocess_shape
         self.pool = ThreadPoolExecutor(
             max_workers=self.max_workers, thread_name_prefix="ImagePreprocessWorker"
         )
@@ -75,7 +77,7 @@ class ParallelImagePreprocessor:
 
     def preprocess_images(
         self,
-        images: List[np.ndarray],
+        images: List[Image.Image],
     ) -> np.ndarray:
         """
         Parallel image preprocessing using thread pool.
@@ -91,10 +93,11 @@ class ParallelImagePreprocessor:
 
         try:
 
-            def _process(image: np.ndarray):
-                return self.preprocess_fn(Image.fromarray(image))
+            out = np.empty((len(images), *self.preprocess_shape[1:]), dtype=np.float32)
+            for i, result in enumerate(self.pool.map(self.preprocess_fn, images)):
+                out[i] = result
 
-            return np.stack(list(self.pool.map(_process, images)), axis=0)
+            return out
 
         except Exception as e:
             logger.error(

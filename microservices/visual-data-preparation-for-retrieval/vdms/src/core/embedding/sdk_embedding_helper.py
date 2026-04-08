@@ -362,7 +362,8 @@ def preload_sdk_client() -> bool:
             # Perform image warmup with a small test pattern
             import numpy as np
 
-            test_image = np.random.randint(0, 255, (8, 8, 3), dtype=np.uint8)
+            test_image = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+
             test_embedding = sdk_client.generate_embeddings_for_images([test_image])
 
             if test_embedding is not None:
@@ -1150,8 +1151,6 @@ def generate_video_embedding_sdk(
 
         total_time = (now_us() - total_start_time) / 1_000_000
         logger.info(f"SDK video processing completed in {total_time:.3f}s")
-
-        # result["total_processing_time"] = total_time
         return result
 
     except Exception as e:
@@ -1185,9 +1184,13 @@ def _process_video_from_memory_simple_pipeline(
         tracer.set_process_name("decode_detect_embed_store_pipeline")
 
         logger.info("Initializing shared memory pools for frames and detected crops...")
-        shm_pool = SharedMemoryPool(max_blocks=1536, block_size=1920 * 1080 * 3)
-        crop_pool = SharedMemoryPool(max_blocks=shm_pool.max_blocks, block_size=shm_pool.block_size)
-        extraction_batch_size = 64
+        shm_pool = SharedMemoryPool(max_blocks=1024, block_size=1920 * 1080 * 3)
+        crop_pool = (
+            SharedMemoryPool(max_blocks=shm_pool.max_blocks, block_size=shm_pool.block_size)
+            if enable_object_detection
+            else None
+        )
+        extraction_batch_size = 256
 
         config = VideoFrameConfig(
             batch_size=extraction_batch_size,  # Large batch for efficient extraction
@@ -1210,6 +1213,7 @@ def _process_video_from_memory_simple_pipeline(
 
         detection_meta_queue: queue.Queue = queue.Queue(maxsize=32)
         embed_sink_queue: queue.Queue = queue.Queue(maxsize=32)
+        store_queue: queue.Queue = queue.Queue(maxsize=32)
         result_queue: queue.Queue = queue.Queue(maxsize=32)
         completion_queue: queue.Queue = queue.Queue(maxsize=1)
 
@@ -1243,10 +1247,16 @@ def _process_video_from_memory_simple_pipeline(
             ),
         )
 
-        embed_sink_thread = threading.Thread(
-            target=embed_store_worker,
-            name="embed_store_worker",
-            args=(embed_sink_queue, result_queue, shm_pool, crop_pool, shutdown_event, tracer),
+        embed_thread = threading.Thread(
+            target=embed_worker,
+            name="embed_thread",
+            args=(embed_sink_queue, store_queue, shm_pool, crop_pool, shutdown_event, tracer),
+        )
+
+        store_thread = threading.Thread(
+            target=store_worker,
+            name="store_thread",
+            args=(store_queue, result_queue, shutdown_event, tracer),
         )
 
         result_thread = threading.Thread(
@@ -1256,7 +1266,8 @@ def _process_video_from_memory_simple_pipeline(
         )
 
         detection_thread.start()
-        embed_sink_thread.start()
+        embed_thread.start()
+        store_thread.start()
         result_thread.start()
 
         total_frames_processed = 0
@@ -1376,126 +1387,21 @@ def _process_video_from_memory_simple_pipeline(
 
         # Join threads BEFORE closing shm_pool; workers may still hold SHM references.
         detection_thread.join()
-        embed_sink_thread.join()
+        embed_thread.join()
+        store_thread.join()
         result_thread.join()
 
         logger.info("Worker threads have been joined successfully")
 
         shm_pool.close()
-        crop_pool.close()
+        if crop_pool:
+            crop_pool.close()
+
         logger.info("Shared memory pool closed and all blocks released")
 
         logger.info("Shutdown Tracer!")
         shutdown_tracer()
-        # stream_stats = processed_result["stream_stats"]["0"]
-        # video_properties = processed_result.get("video_metadata", {})[0]
-        # batch_details = processed_result.get("batch_details", [])
 
-        # stored_ids = stream_stats.get("stored_ids", [])
-        # total_frames_processed = stream_stats.get("total_frames_processed", 0)
-        # total_detected_items = stream_stats.get("total_detected_crops", 0)
-        # total_stored_ids = stream_stats.get("total_stored_ids", 0)
-
-        # stream_stats = stream_stats.get("metrics", {})
-        # detect_stat = stream_stats.get("detect")
-        # embed_stat = stream_stats.get("embed")
-        # store_stat = stream_stats.get("store")
-        # decode_stat = stream_stats.get("decode")
-        # embed_preprocess_stat = stream_stats.get("embed_preprocess_time")
-        # embed_inference_stat = stream_stats.get("embed_inference_time")
-
-        # parallel_stage_time = max(
-        #     [decode_stat["total"], embed_stat["total"], store_stat["total"], detect_stat["total"]]
-        # )
-        # frame_extraction_time = decode_stat["total"] if decode_stat else 0.0
-
-        # stage_breakdown = {
-        #     "detection": {
-        #         "avg_s": detect_stat.get("avg", 0.0),
-        #         "max_s": detect_stat.get("max", 0.0),
-        #         "total_s": detect_stat.get("total", 0.0),
-        #         "avg_pct_of_batch": (
-        #             (detect_stat.get("avg", 0.0) / parallel_stage_time * 100.0)
-        #             if parallel_stage_time
-        #             else 0.0
-        #         ),
-        #     },
-        #     "embedding": {
-        #         "avg_s": embed_stat.get("avg", 0.0),
-        #         "max_s": embed_stat.get("max", 0.0),
-        #         "total_s": embed_stat.get("total", 0.0),
-        #         "avg_pct_of_batch": (
-        #             (embed_stat.get("avg", 0.0) / parallel_stage_time * 100.0)
-        #             if parallel_stage_time
-        #             else 0.0
-        #         ),
-        #         "preprocess": {
-        #             "avg_s": embed_preprocess_stat.get("avg", 0.0),
-        #             "max_s": embed_preprocess_stat.get("max", 0.0),
-        #             "total_s": embed_preprocess_stat.get("total", 0.0),
-        #             "avg_pct_of_batch": (
-        #                 (embed_preprocess_stat.get("avg", 0.0) / parallel_stage_time * 100.0)
-        #                 if parallel_stage_time
-        #                 else 0.0
-        #             ),
-        #         },
-        #         "inference": {
-        #             "avg_s": embed_inference_stat.get("avg", 0.0),
-        #             "max_s": embed_inference_stat.get("max", 0.0),
-        #             "total_s": embed_inference_stat.get("total", 0.0),
-        #             "avg_pct_of_batch": (
-        #                 (embed_inference_stat.get("avg", 0.0) / parallel_stage_time * 100.0)
-        #                 if parallel_stage_time
-        #                 else 0.0
-        #             ),
-        #         },
-        #     },
-        #     "storage": {
-        #         "avg_s": store_stat.get("avg", 0.0),
-        #         "max_s": store_stat.get("max", 0.0),
-        #         "total_s": store_stat.get("total", 0.0),
-        #         "avg_pct_of_batch": (
-        #             (store_stat.get("avg", 0.0) / parallel_stage_time * 100.0)
-        #             if parallel_stage_time
-        #             else 0.0
-        #         ),
-        #     },
-        #     "decode": {
-        #         "avg_s": decode_stat.get("avg", 0.0),
-        #         "max_s": decode_stat.get("max", 0.0),
-        #         "total_s": decode_stat.get("total", 0.0),
-        #         "avg_pct_of_batch": (
-        #             (decode_stat.get("avg", 0.0) / parallel_stage_time * 100.0)
-        #             if parallel_stage_time
-        #             else 0.0
-        #         ),
-        #     },
-        # }
-        # logger.info(f"Stage breakdown: {stage_breakdown}")
-        # method_time = now_us() - method_start_time
-        # pipeline_config = get_pipeline_config()
-        # result = {
-        #     "status": "success",
-        #     "stored_ids": stored_ids,
-        #     "total_embeddings": total_stored_ids,
-        #     "total_frames_processed": total_frames_processed,
-        #     "frame_interval": frame_interval,
-        #     "timing": {
-        #         "frame_extraction_time": frame_extraction_time,
-        #         "parallel_stage_time": parallel_stage_time,
-        #         "pipeline_wall_time": method_time,
-        #         "stage_breakdown": stage_breakdown,
-        #     },
-        #     "frame_counts": {
-        #         "extracted_frames": total_frames_processed,
-        #         "post_detection_items": total_detected_items,
-        #         "stored_embeddings": total_stored_ids,
-        #     },
-        #     "processing_mode": "sdk_simple_pipeline_with_batch_storage",
-        #     "batch_details": batch_details,
-        #     "pipeline_config": pipeline_config,
-        #     "video_properties": video_properties,
-        # }
 
         logger.info("Simple pipeline processing completed successfully")
 
@@ -1595,13 +1501,34 @@ def process_frame_detection(
     return cropped_results
 
 
-def _map_shared_frame(d):
+def _map_shared_frame(d, to_pil=True):
     shm = shared_memory.SharedMemory(name=d["shm"])
     arr = np.ndarray(
         eval(d["shape"]),
         dtype=np.dtype(d["dtype"]),
         buffer=shm.buf,
     )
+
+    # PIL from buffer
+    # assert arr.dtype == np.uint8
+    # assert arr.flags["C_CONTIGUOUS"]
+    
+    # if arr.ndim == 3 and arr.shape[2] == 3:
+    #     mode = "RGB"
+    #     h, w, _ = arr.shape
+    # elif arr.ndim == 2:
+    #     mode = "L"
+    #     h, w = arr.shape
+    # else:
+    #     raise ValueError("Unsupported shape")
+    if to_pil:
+        h, w, _ = arr.shape
+        arr = Image.frombuffer("RGB", (w, h), arr.data, "raw", "RGB", 0, 1)
+
+    # PIL from array
+    # img_arr = Image.fromarray(arr)
+    # print(np.all(np.array(img) == np.array(img_arr)))
+
     return shm, arr, d
 
 
@@ -1618,7 +1545,7 @@ def allocate_detected_crops(
     mapped = []
     for d in batch["frames"]:
         try:
-            shm, arr, meta = _map_shared_frame(d)
+            shm, arr, meta = _map_shared_frame(d, to_pil=False)
             shm_handles.append(shm)
             mapped.append((arr, meta))
         except Exception as e:
@@ -1653,7 +1580,7 @@ def allocate_detected_crops(
 def detection_worker(
     detection_meta_queue: queue.Queue,
     embed_sink_queue: queue.Queue,
-    crop_pool: SharedMemoryPool,
+    crop_pool: Optional[SharedMemoryPool],
     enable_object_detection: bool,
     detection_confidence: float,
     shutdown_event: threading.Event,
@@ -1663,9 +1590,9 @@ def detection_worker(
     detector = get_global_detector(enable_object_detection, detection_confidence)
 
     tid = threading.get_ident()
-
     if tracer is not None and tracer.should_trace():
-        tracer.set_thread_name(tid=tid, name="detection_x_thread")
+        tracer.set_thread_name(tid=tid, name="detection_thread")
+        # tracer.set_thread_name(tid=tid + 1, name="decode_detect_queue_wait")
 
     while True:
         try:
@@ -1673,7 +1600,7 @@ def detection_worker(
                 logger.debug("[DETECTION WORKER] Shutdown event set, exiting.")
                 break
             batch = detection_meta_queue.get(timeout=1)
-            detection_time = now_us()
+            ts_deq = now_us()
         except queue.Empty:
             logger.warning("[DETECTION QUEUE EMPTY] WAITING...")
             continue
@@ -1689,56 +1616,64 @@ def detection_worker(
             stream_id = batch["stream_id"]
             batch_id = batch["batch_id"]
             batch_size = batch["batch_size"]
+            flow_id = f"s{stream_id}_b{batch_id}"
 
-            if tracer is not None and tracer.should_trace():
-                flow_id = f"s{stream_id}_b{batch_id}"
 
+            if tracer and tracer.should_trace():
+                tracer.flow_step(flow_id, tid=tid, ts=batch["enqueue_ts"])
                 tracer.emit_complete(
-                    "detect_queue_wait",
+                    "wait",
                     batch["enqueue_ts"],
-                    detection_time,
+                    ts_deq,
                     tid=tid,
                     cat="queue",
                     args={
-                        "batch_id": batch_id,
-                        "stream_id": stream_id,
-                        "input_batch_size": batch_size,
-                    },
+                        "flow_id": flow_id
+                    }
                 )
-                tracer.flow_step(flow_id, tid=tid, ts=detection_time)
+
+            detection_start_time = now_us()
+
+            # FLOW enters compute
+            if tracer and tracer.should_trace():
+                tracer.flow_step(flow_id, tid=tid, ts=detection_start_time)
 
             if enable_object_detection:
                 detected_crops_metadata = allocate_detected_crops(
                     batch, thread_pool, detector, crop_pool=crop_pool
                 )
+
                 batch["frames"].extend(detected_crops_metadata)
 
-            batch["total"] = len(batch["frames"])
+            detection_end_time = now_us()
 
-            ts1 = now_us()
             if tracer.should_trace():
                 tracer.emit_complete(
                     "detect",
-                    detection_time,
-                    ts1,
+                    detection_start_time,
+                    detection_end_time,
                     tid,
                     args={
                         "batch_id": batch_id,
                         "stream_id": stream_id,
                         "input_batch_size": batch_size,
-                        "detected_crops": batch["total"] - batch_size,
-                        "total_batch_size": batch["total"],
+                        "detected_crops": len(batch["frames"]) - batch_size,
+                        "total_processed": len(batch["frames"]),
+                        "flow_id": flow_id,
                     },
                 )
 
-            batch["enqueue_ts"] = ts1
-
-            detection_end_time = now_us()
             stats["detect"] = (
-                detection_time,
+                detection_start_time,
                 detection_end_time,
-                (detection_end_time - detection_time) / 1_000_000,
+                (detection_end_time - detection_start_time) / 1_000_000,
             )
+
+            batch["total"] = len(batch["frames"])
+            batch["enqueue_ts"] = detection_end_time
+
+            if tracer and tracer.should_trace():
+                tracer.flow_step(flow_id, tid=tid, ts=detection_end_time)
 
             embed_sink_queue.put(batch)
 
@@ -1754,11 +1689,11 @@ def detection_worker(
     logger.info("Detection worker shutdown complete")
 
 
-def embed_store_worker(
+def embed_worker(
     embed_sink_queue: queue.Queue,
-    result_queue: queue.Queue,
+    store_queue: queue.Queue,
     shm_pool: SharedMemoryPool,
-    crop_pool: SharedMemoryPool,
+    crop_pool: Optional[SharedMemoryPool],
     shutdown_event: threading.Event,
     tracer: Tracer,
 ):
@@ -1768,7 +1703,7 @@ def embed_store_worker(
     tid = threading.get_ident()
 
     if tracer is not None and tracer.should_trace():
-        tracer.set_thread_name(tid=tid, name="embed_store_thread")
+        tracer.set_thread_name(tid=tid, name="embed_thread")
 
     while True:
         try:
@@ -1792,61 +1727,56 @@ def embed_store_worker(
 
         try:
             stats = batch.setdefault("stats", {})
-            shm_map_time = now_us()
-            frame_batch = list(thread_pool.map(_map_shared_frame, batch["frames"]))
-            shm_handles, batch_frame_np, batch_frame_meta = tuple(map(list, zip(*frame_batch)))
-            shm_map_end_time = (now_us() - shm_map_time) / 1_000_000
-
-            logger.info(
-                f"Mapped shared memory for {len(batch_frame_np)} frames in {shm_map_end_time:.3f}s, starting embedding generation..."
-            )
-
-            embedding_time = now_us()
 
             stream_id = batch["stream_id"]
             batch_id = batch["batch_id"]
-            batch_size = batch["batch_size"]
             flow_id = f"s{stream_id}_b{batch_id}"
 
-            if tracer is not None and tracer.should_trace():
+            # FLOW ARRIVAL
+            if tracer and tracer.should_trace():
+                tracer.flow_step(flow_id, tid=tid, ts=batch["enqueue_ts"])
 
                 tracer.emit_complete(
-                    "embed_store_queue_wait",
+                    "embed_wait",
                     batch["enqueue_ts"],
                     ts_deq,
                     tid=tid,
                     cat="queue",
-                    args={
-                        "batch_id": batch_id,
-                        "stream_id": stream_id,
-                        "input_batch_size": batch_size,
-                    },
                 )
 
-                tracer.flow_step(flow_id, tid=tid, ts=ts_deq)
+            frame_batch = list(thread_pool.map(_map_shared_frame, batch["frames"]))
+            shm_handles, batch_frame_pil, batch_frame_meta = tuple(map(list, zip(*frame_batch)))
+            
+            # ---- EMBEDDING ----
+            embedding_time = now_us()
+
+            # FLOW enters compute
+            if tracer and tracer.should_trace():
+                tracer.flow_step(flow_id, tid=tid, ts=embedding_time)
 
             embedding, embedding_metrics = _sdk_client.generate_embeddings_for_images(
-                batch_frame_np, metrics_out=True
+                batch_frame_pil, metrics_out=True
             )
 
-            ts1 = now_us()
-            if tracer is not None and tracer.should_trace():
+            embedding_end_time = now_us()
+
+            if tracer and tracer.should_trace():
                 tracer.emit_complete(
                     "embed",
                     embedding_time,
-                    ts1,
+                    embedding_end_time,
                     tid,
-                    cat="gpu",  # useful for visualization
+                    cat="gpu",
                     args={
                         "batch_id": batch_id,
                         "stream_id": stream_id,
-                        "total": batch["batch_size"],
+                        "batch_size": batch["batch_size"],
+                        "total_embeddings": len(embedding),
                         "embed_preprocess_time": embedding_metrics[0],
                         "embed_infer_time": embedding_metrics[1],
                     },
                 )
 
-            embedding_end_time = now_us()
             stats["embed"] = (
                 embedding_time,
                 embedding_end_time,
@@ -1854,45 +1784,133 @@ def embed_store_worker(
             )
 
             logger.debug(
-                f"[EMBED_WORKER] Worker generated embeddings for {len(embedding)} frames/crops in {(embedding_end_time - embedding_time):.3f}s, now storing embeddings..."
+                f"[EMBED_WORKER] Worker generated embeddings for {len(embedding)} frames/crops in {(embedding_end_time - embedding_time) / 1_000_000}s"
             )
+
+            if embedding_metrics:
+                logger.debug(f"Embedding metrics for batch: {embedding_metrics}")
+                stats["embed_metrics"] = embedding_metrics
+
+            batch["enqueue_ts"] = embedding_end_time
+
+            if tracer and tracer.should_trace():
+                tracer.flow_step(flow_id, tid=tid, ts=embedding_end_time)
+
+            store_queue.put((embedding, batch_frame_meta, batch))
+
+            thread_pool.map(
+                lambda d: (
+                    crop_pool.release(d["shm"])
+                    if "is_detected_crop" in d
+                    else shm_pool.release(d["shm"])
+                ),
+                batch_frame_meta,
+            )
+
+        except Exception as e:
+            logger.error(
+                f"[EMBED_WORKER] Error in embed store worker processing: {e}", exc_info=True
+            )
+            continue
+
+        logger.debug("[EMBED_WORKER] ONTO NEXT BATCH...")
+
+    logger.debug("[EMBED_WORKER] Worker shutting down, putting None signal in store_queue")
+    store_queue.put(DONE)
+    thread_pool.shutdown(wait=True)
+    logger.info("[EMBED_WORKER] Worker shutdown complete")
+
+
+def store_worker(
+    store_queue: queue.Queue,
+    result_queue: queue.Queue,
+    shutdown_event: threading.Event,
+    tracer: Tracer,
+):
+    _sdk_client = get_sdk_client()
+
+    tid = threading.get_ident()
+
+    if tracer is not None and tracer.should_trace():
+        tracer.set_thread_name(tid=tid, name="store_thread")
+
+    while True:
+        try:
+            if shutdown_event.is_set():
+                logger.debug("[STORE_WORKER] Shutdown event set, exiting.")
+                break
+
+            # Batch comprises of a list of full +/- detected crops metadata
+            batch_result = store_queue.get(timeout=1)
+            ts_deq = now_us()
+        except queue.Empty:
+            if shutdown_event.is_set():
+                logger.debug("[STORE_WORKER] Shutdown event set, exiting.")
+                break
+            logger.warning("[STORE_WORKER] Queue empty, waiting...")
+            continue
+
+        if batch_result is DONE:
+            logger.info("[STORE_WORKER] Worker received shutdown signal, exiting.")
+            break
+
+        try:
+            embedding, batch_frame_meta, batch = batch_result
+            stats = batch.setdefault("stats", {})
+
+            stream_id = batch["stream_id"]
+            batch_id = batch["batch_id"]
+            batch_size = batch["batch_size"]
+            flow_id = f"s{stream_id}_b{batch_id}"
+
+            # FLOW ARRIVAL
+            if tracer and tracer.should_trace():
+                tracer.flow_step(flow_id, tid=tid, ts=batch["enqueue_ts"])
+
+                tracer.emit_complete(
+                    "wait",
+                    batch["enqueue_ts"],
+                    ts_deq,
+                    tid=tid,
+                    cat="queue",
+                    args={
+                        "flow_id": flow_id,
+                    }
+                )
 
             storage_time = now_us()
 
-            if tracer.should_trace():
+            if tracer and tracer.should_trace():
                 tracer.flow_step(flow_id, tid=tid, ts=storage_time)
+            
 
             saved_ids = _sdk_client.store_frame_embeddings(embedding, batch_frame_meta)
+            batch["stored_ids"] = saved_ids
 
-            ts1 = now_us()
-            if tracer.should_trace():
+            storage_end_time = now_us()
+
+            if tracer and tracer.should_trace():
                 tracer.emit_complete(
                     "store",
                     storage_time,
-                    ts1,
+                    storage_end_time,
                     tid,
                     args={
                         "batch_id": batch_id,
                         "stream_id": stream_id,
-                        "total": batch["batch_size"],
+                        "batch_size": batch_size,
+                        "total_stored_ids": len(saved_ids),
                     },
                 )
+                if tracer and tracer.should_trace():
+                    tracer.flow_end(flow_id, tid=tid, ts=storage_end_time)
 
-                # end of pipeline
-                tracer.flow_end(flow_id, tid=tid, ts=ts1)
-
-            batch["enqueue_ts"] = ts1
-            storage_end_time = now_us()
+            batch["enqueue_ts"] = storage_end_time
             stats["store"] = (
                 storage_time,
                 storage_end_time,
                 (storage_end_time - storage_time) / 1_000_000,
             )
-
-            batch["stored_ids"] = saved_ids
-            if embedding_metrics:
-                logger.debug(f"Embedding metrics for batch: {embedding_metrics}")
-                stats["embed_metrics"] = embedding_metrics
 
             logger.info(
                 f"[EMBED_WORKER] Worker stored embeddings for {len(saved_ids)} frames/crops in {(storage_end_time - storage_time) / 1_000_000}s"
@@ -1900,6 +1918,12 @@ def embed_store_worker(
 
             stats["total"] = (
                 stats["decode"][2] + stats["detect"][2] + stats["embed"][2] + stats["store"][2]
+            )
+            stats["max"] = max(
+                stats["decode"][2],
+                stats["detect"][2],
+                stats["embed"][2],
+                stats["store"][2],
             )
 
             # Calculate Batch Level Metrics
@@ -1921,10 +1945,13 @@ def embed_store_worker(
             metrics["detect_embed_queue_wait_s"] = (
                 stats["embed"][0] - stats["detect"][1]
             ) / 1_000_000
+            metrics["embed_store_queue_wait_s"] = (
+                stats["store"][0] - stats["embed"][1]
+            ) / 1_000_000
 
             # Throughput
             metrics["decode_batch_tput_fps"] = batch.get("batch_size", 0) / stats["decode"][2]
-            metrics["detect_batch_tput_fps"] = batch.get("batch_size", 0) / stats["detect"][2]
+            metrics["detect_batch_tput_fps"] = batch.get("batch_size", 0) / (stats["detect"][2] + 1e-8)
             metrics["embed_batch_tput_fps"] = batch.get("total", 0) / stats["embed"][2]
             metrics["store_batch_tput_fps"] = batch.get("total", 0) / stats["store"][2]
             metrics["raw_embed_preproc_batch_tput_fps"] = (
@@ -1937,30 +1964,18 @@ def embed_store_worker(
             result_queue.put(batch)
 
             logger.debug(
-                f"[EMBED_WORKER] Worker completed batch processing, releasing shared memory blocks"
-            )
-
-            thread_pool.map(
-                lambda d: (
-                    crop_pool.release(d["shm"])
-                    if "is_detected_crop" in d
-                    else shm_pool.release(d["shm"])
-                ),
-                batch_frame_meta,
+                f"[STORE_WORKER] Worker completed batch processing, releasing shared memory blocks"
             )
 
         except Exception as e:
             logger.error(
-                f"[EMBED_WORKER] Error in embed store worker processing: {e}", exc_info=True
+                f"[STORE_WORKER] Error in embed store worker processing: {e}", exc_info=True
             )
             continue
 
-        logger.debug("[EMBED_WORKER] ONTO NEXT BATCH...")
-
-    logger.debug("[EMBED_WORKER] Worker shutting down, putting None signal in result_queue")
+    logger.debug("[STORE_WORKER] Worker shutting down, putting None signal in result_queue")
     result_queue.put(DONE)
-    thread_pool.shutdown(wait=True)
-    logger.info("[EMBED_WORKER] Worker shutdown complete")
+    logger.info("[STORE_WORKER] Worker shutdown complete")
 
 
 def _summarize_stage_times(samples: List[float]) -> Dict[str, float]:
@@ -2001,6 +2016,7 @@ def save_batch_results(completed_batches, all_stream_metadata):
                 "total_stored_ids": 0,
                 "decode_detect_queue_wait_s": 0.0,
                 "detect_embed_queue_wait_s": 0.0,
+                "embed_store_queue_wait_s": 0.0,
                 "stats": {
                     "detect": [],
                     "embed": [],
@@ -2061,6 +2077,9 @@ def save_batch_results(completed_batches, all_stream_metadata):
         )
         stream_stats[f"{stream_id}"]["detect_embed_queue_wait_s"] += batch["metrics"].get(
             "detect_embed_queue_wait_s", 0.0
+        )
+        stream_stats[f"{stream_id}"]["embed_store_queue_wait_s"] += batch["metrics"].get(
+            "embed_store_queue_wait_s", 0.0
         )
 
     for k, v in stream_stats.items():
