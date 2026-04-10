@@ -1190,7 +1190,7 @@ def _process_video_from_memory_simple_pipeline(
             if enable_object_detection
             else None
         )
-        extraction_batch_size = 256
+        extraction_batch_size = 512
 
         config = VideoFrameConfig(
             batch_size=extraction_batch_size,  # Large batch for efficient extraction

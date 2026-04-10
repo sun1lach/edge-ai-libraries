@@ -18,6 +18,7 @@ The implementation includes support for OpenVINO optimization to improve inferen
 performance on Intel hardware.
 """
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 from typing import List, Union, Dict, Any, Optional
 import time
@@ -84,7 +85,21 @@ class CLIPHandler(BaseEmbeddingModel):
         self._preprocess_workers = model_config.get("preprocess_workers", min(16, (os.cpu_count() or 4) * 2))
         self.async_infer = None
         self.parallel_preprocessor: Optional[ParallelImagePreprocessor] = None
-        
+        self.thread_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="CLIPPreprocessor"
+        )
+
+    def __del__(self):
+        if hasattr(self, "thread_pool") and self.thread_pool is not None:
+            self.thread_pool.shutdown(wait=True)
+            self.thread_pool = None
+        if (
+            hasattr(self, "parallel_preprocessor")
+            and self.parallel_preprocessor is not None
+        ):
+            self.parallel_preprocessor.close()
+            self.parallel_preprocessor = None
+
     def load_model(self) -> None:
         """
         Load CLIP model and associated components.
@@ -230,21 +245,78 @@ class CLIPHandler(BaseEmbeddingModel):
         if isinstance(images, Image.Image):
             images = [images]
 
-        logger.info(f"====AsyncInferQueue====")
+        if not images:
+            raise ValueError("images must be non-empty")
+
+        if self.parallel_preprocessor is None or self.async_infer is None:
+            raise RuntimeError(
+                "OpenVINO preprocessing/inference pipeline is not initialized. Call load_model() first."
+            )
+
+        batch_size = max(64, int(self.preprocess_shape[0]))
+        num_images = len(images)
+        num_batches = (num_images + batch_size - 1) // batch_size
+
         pre_process_start = time.perf_counter()
-        pre_processed_images = self.parallel_preprocessor.preprocess_images(images)
-        preprocess_end = time.perf_counter()
-        infer_start = time.perf_counter()
-        embeddings = self.async_infer.infer(pre_processed_images)
+        preprocess_time_s = 0.0
+        inference_time_s = 0.0
+        embeddings: Optional[np.ndarray] = None
+        write_offset = 0
+
+        # Pipeline two stages:
+        #   1) CPU preprocess next batch
+        #   2) iGPU inference on current batch
+        # This overlaps both stages to improve end-to-end throughput.
+        first_batch = images[:batch_size]
+        preprocess_future = self.thread_pool.submit(
+            self.parallel_preprocessor.preprocess_images,
+            first_batch,
+        )
+
+        for batch_idx in range(num_batches):
+            preprocess_batch_start = time.perf_counter()
+            pre_processed_batch = preprocess_future.result()
+            preprocess_time_s += time.perf_counter() - preprocess_batch_start
+
+            next_start = (batch_idx + 1) * batch_size
+            if next_start < num_images:
+                next_end = min(next_start + batch_size, num_images)
+                preprocess_future = self.thread_pool.submit(
+                    self.parallel_preprocessor.preprocess_images,
+                    images[next_start:next_end],
+                )
+
+            infer_batch_start = time.perf_counter()
+            batch_embeddings = self.async_infer.infer(pre_processed_batch)
+            inference_time_s += time.perf_counter() - infer_batch_start
+
+            if embeddings is None:
+                embedding_dim = int(batch_embeddings.shape[1])
+                embeddings = np.empty((num_images, embedding_dim), dtype=batch_embeddings.dtype)
+
+            batch_len = batch_embeddings.shape[0]
+            embeddings[write_offset : write_offset + batch_len] = batch_embeddings
+            write_offset += batch_len
+
         infer_end = time.perf_counter()
-        logger.info(f"Inference time for batch of {len(images)} images: {infer_end - infer_start:.4f} seconds")
+        if embeddings is None:
+            raise RuntimeError("No embeddings generated")
+        logger.info(
+            "Pipelined inference for batch of %d images took %.4f seconds",
+            num_images,
+            infer_end - pre_process_start,
+        )
+
         if metrics_out:
+            print("Total inference time (s):", infer_end - pre_process_start)
+            print("Preprocessing time (s):", preprocess_time_s)
+            print("Inference time (s):", inference_time_s)
             return {
                 "embeddings": embeddings,
-                "preprocess_time_s": preprocess_end - pre_process_start,
-                "inference_time_s": infer_end - infer_start,
+                "preprocess_time_s": preprocess_time_s,
+                "inference_time_s": inference_time_s,
                 "total_time_s": infer_end - pre_process_start,
-                "processed_images": len(images)
+                "processed_images": len(images),
             }
         return embeddings
 

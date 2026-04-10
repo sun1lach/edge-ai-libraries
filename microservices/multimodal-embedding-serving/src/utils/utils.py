@@ -94,8 +94,14 @@ class ParallelImagePreprocessor:
         try:
 
             out = np.empty((len(images), *self.preprocess_shape[1:]), dtype=np.float32)
-            for i, result in enumerate(self.pool.map(self.preprocess_fn, images)):
-                out[i] = result
+
+            futures = [
+                self.pool.submit(self._preprocess_into, index, image, out)
+                for index, image in enumerate(images)
+            ]
+
+            for future in futures:
+                future.result()
 
             return out
 
