@@ -20,6 +20,7 @@ Performance Benefits:
 """
 
 from datetime import datetime
+import gc
 import json
 import multiprocessing
 import os
@@ -51,10 +52,17 @@ from src.common import init_tracer
 from src.common import now_us
 from src.common import Tracer
 
+from memory_profiler import profile
 from src.core.embedding.decoder import SharedMemoryPool
 from src.core.embedding.decoder import VideoFrameConfig
 from src.core.embedding.decoder import VideoFrameExtractor
 from src.core.embedding.sdk_client import SDKVDMSClient
+
+# import debugpy
+# debugpy.listen(5678)
+# logger.info("Debugpy is listening on port 5678 for debugger attachment")
+# debugpy.wait_for_client()
+# logger.info("Debugger attached, proceeding with execution")
 
 # Global SDK client instance (initialized once per worker process)
 _sdk_client: Optional[SDKVDMSClient] = None
@@ -1080,7 +1088,7 @@ class SimplePipelineManager:
 
         return embeddings
 
-
+@profile
 def generate_video_embedding_sdk(
     video_content: bytes,
     metadata_dict: Dict[str, Any],
@@ -1158,7 +1166,7 @@ def generate_video_embedding_sdk(
         logger.error(f"SDK video processing failed after {total_time:.3f}s: {e}")
         raise
 
-
+@profile
 def _process_video_from_memory_simple_pipeline(
     video_content: bytes,
     sdk_client: SDKVDMSClient,
@@ -1190,7 +1198,7 @@ def _process_video_from_memory_simple_pipeline(
             if enable_object_detection
             else None
         )
-        extraction_batch_size = 512
+        extraction_batch_size = 1024
 
         config = VideoFrameConfig(
             batch_size=extraction_batch_size,  # Large batch for efficient extraction
@@ -1402,9 +1410,15 @@ def _process_video_from_memory_simple_pipeline(
         logger.info("Shutdown Tracer!")
         shutdown_tracer()
 
-
         logger.info("Simple pipeline processing completed successfully")
 
+        gc.collect()
+
+        for obj in gc.get_objects():
+            if type(obj).__name__ == "MyLargeObject":
+                print(obj)
+                print(gc.get_referrers(obj))
+        
         return processed_result
 
     except Exception as e:
@@ -1798,14 +1812,14 @@ def embed_worker(
 
             store_queue.put((embedding, batch_frame_meta, batch))
 
-            thread_pool.map(
+            list(thread_pool.map(
                 lambda d: (
                     crop_pool.release(d["shm"])
                     if "is_detected_crop" in d
                     else shm_pool.release(d["shm"])
                 ),
                 batch_frame_meta,
-            )
+            ))
 
         except Exception as e:
             logger.error(

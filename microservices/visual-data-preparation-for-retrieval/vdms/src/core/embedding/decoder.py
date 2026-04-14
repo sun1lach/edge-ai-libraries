@@ -24,6 +24,7 @@ from typing import Generator
 from typing import List
 from typing import Tuple
 from typing import Union
+from memory_profiler import profile
 
 import av
 import numpy as np
@@ -645,7 +646,8 @@ class VideoFrameExtractor:
             return av.open(bytes_io)
         else:
             raise ValueError(f"Unsupported source type: {video_input.source_type}")
-
+    
+    @profile
     def decode_frames(self) -> Generator[List[Dict[str, Any]], None, None]:
         """
         Extract frames from single or multiple video sources in parallel.

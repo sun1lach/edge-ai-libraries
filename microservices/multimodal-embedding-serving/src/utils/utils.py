@@ -30,6 +30,7 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
 
+from memory_profiler import profile
 import decord
 import av
 import httpx
@@ -70,11 +71,33 @@ class ParallelImagePreprocessor:
             max_workers=self.max_workers, thread_name_prefix="ImagePreprocessWorker"
         )
 
-    def __del__(self):
-        # Ensure threads are cleaned up
+    def close(self):
         if self.pool:
+            print("Shutting down image preprocessing thread pool")
             self.pool.shutdown(wait=True)
+            self.pool = None
 
+    def __del__(self):
+        self.close()
+
+    def _preprocess_into(self, index: int, image: Image.Image, out: np.ndarray) -> None:
+        """
+        Preprocess a single image and store result in output array.
+
+        Args:
+            index: Index in the output array where result should be stored
+            image: Image to preprocess
+            out: Output array to write preprocessed image into
+        """
+        preprocessed = self.preprocess_fn(image)
+        # Convert to numpy array if needed
+        if isinstance(preprocessed, np.ndarray):
+            out[index] = preprocessed
+        else:
+            # Handle torch tensors or other formats
+            out[index] = np.array(preprocessed)
+
+    @profile
     def preprocess_images(
         self,
         images: List[Image.Image],

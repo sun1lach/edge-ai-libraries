@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 import os
 
+from memory_profiler import profile
 import open_clip
 import shutil
 
@@ -85,14 +86,8 @@ class CLIPHandler(BaseEmbeddingModel):
         self._preprocess_workers = model_config.get("preprocess_workers", min(16, (os.cpu_count() or 4) * 2))
         self.async_infer = None
         self.parallel_preprocessor: Optional[ParallelImagePreprocessor] = None
-        self.thread_pool = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="CLIPPreprocessor"
-        )
 
     def __del__(self):
-        if hasattr(self, "thread_pool") and self.thread_pool is not None:
-            self.thread_pool.shutdown(wait=True)
-            self.thread_pool = None
         if (
             hasattr(self, "parallel_preprocessor")
             and self.parallel_preprocessor is not None
@@ -228,6 +223,7 @@ class CLIPHandler(BaseEmbeddingModel):
         text_features = F.normalize(text_features, dim=-1)
         return text_features
     
+    @profile
     def encode_image(self, images: Union[Image.Image, List[Image.Image]], metrics_out: bool = False) -> Union[Dict[str, Any], torch.Tensor]:
         """
         Generate embeddings for a batch of images using CLIP image encoder with OpenVINO optimization.
@@ -262,41 +258,72 @@ class CLIPHandler(BaseEmbeddingModel):
         inference_time_s = 0.0
         embeddings: Optional[np.ndarray] = None
         write_offset = 0
+        preprocess_future = None
+        pre_processed_batch = None
+        batch_embeddings = None
 
-        # Pipeline two stages:
-        #   1) CPU preprocess next batch
-        #   2) iGPU inference on current batch
-        # This overlaps both stages to improve end-to-end throughput.
-        first_batch = images[:batch_size]
-        preprocess_future = self.thread_pool.submit(
-            self.parallel_preprocessor.preprocess_images,
-            first_batch,
-        )
-
-        for batch_idx in range(num_batches):
-            preprocess_batch_start = time.perf_counter()
-            pre_processed_batch = preprocess_future.result()
-            preprocess_time_s += time.perf_counter() - preprocess_batch_start
-
-            next_start = (batch_idx + 1) * batch_size
-            if next_start < num_images:
-                next_end = min(next_start + batch_size, num_images)
-                preprocess_future = self.thread_pool.submit(
+        try:
+            # Pipeline two stages:
+            #   1) CPU preprocess next batch
+            #   2) iGPU inference on current batch
+            # This overlaps both stages to improve end-to-end throughput.
+            #
+            # Image-slice references are passed directly into submit() so no named
+            # variable outside the future holds them.  Each intermediate tensor is
+            # set to None as soon as it has been consumed so the shared-memory
+            # backing of the PIL images can be released as early as possible.
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="CLIPPreprocessor") as thread_pool:
+                preprocess_future = thread_pool.submit(
                     self.parallel_preprocessor.preprocess_images,
-                    images[next_start:next_end],
+                    images[:batch_size],
                 )
 
-            infer_batch_start = time.perf_counter()
-            batch_embeddings = self.async_infer.infer(pre_processed_batch)
-            inference_time_s += time.perf_counter() - infer_batch_start
+                for batch_idx in range(num_batches):
+                    preprocess_batch_start = time.perf_counter()
+                    pre_processed_batch = preprocess_future.result()
+                    preprocess_future = None  # future is done; drop it so the image-slice arg is freed
+                    preprocess_time_s += time.perf_counter() - preprocess_batch_start
 
-            if embeddings is None:
-                embedding_dim = int(batch_embeddings.shape[1])
-                embeddings = np.empty((num_images, embedding_dim), dtype=batch_embeddings.dtype)
+                    next_start = (batch_idx + 1) * batch_size
+                    if next_start < num_images:
+                        next_end = min(next_start + batch_size, num_images)
+                        preprocess_future = thread_pool.submit(
+                            self.parallel_preprocessor.preprocess_images,
+                            images[next_start:next_end],
+                        )
 
-            batch_len = batch_embeddings.shape[0]
-            embeddings[write_offset : write_offset + batch_len] = batch_embeddings
-            write_offset += batch_len
+                    infer_batch_start = time.perf_counter()
+                    batch_embeddings = self.async_infer.infer(pre_processed_batch)
+                    pre_processed_batch = None  # preprocessed tensor no longer needed after infer()
+                    inference_time_s += time.perf_counter() - infer_batch_start
+
+                    if embeddings is None:
+                        embedding_dim = int(batch_embeddings.shape[1])
+                        embeddings = np.empty((num_images, embedding_dim), dtype=batch_embeddings.dtype)
+
+                    batch_len = batch_embeddings.shape[0]
+                    embeddings[write_offset : write_offset + batch_len] = batch_embeddings
+                    write_offset += batch_len
+                    batch_embeddings = None  # already copied into embeddings; release now
+
+                # __exit__ calls shutdown(wait=True): every work item is finished and the
+                # thread holds no references to image slices before we proceed past here.
+
+        finally:
+            # Cancel/drain any outstanding future on the exception path.
+            if preprocess_future is not None:
+                try:
+                    preprocess_future.result(timeout=5.0)
+                    logger.info("Preprocessing future completed successfully during cleanup")
+                except Exception as cleanup_error:
+                    logger.error("Error cleaning up preprocessing future: %s", cleanup_error)
+                preprocess_future = None
+            # Drop this function's own reference to the input list.  The caller still
+            # holds their reference, but this frame no longer keeps PIL objects (which
+            # may be zero-copy views into shared memory) alive.
+            images = None
+            pre_processed_batch = None
+            batch_embeddings = None
 
         infer_end = time.perf_counter()
         if embeddings is None:
@@ -316,7 +343,7 @@ class CLIPHandler(BaseEmbeddingModel):
                 "preprocess_time_s": preprocess_time_s,
                 "inference_time_s": inference_time_s,
                 "total_time_s": infer_end - pre_process_start,
-                "processed_images": len(images),
+                "processed_images": num_images,
             }
         return embeddings
 
@@ -456,7 +483,9 @@ class CLIPHandler(BaseEmbeddingModel):
                 device = torch.device("cpu")
                 dtype = torch.float32
 
-            image_tensor = image_tensor.to(device=device, dtype=dtype)
+            # Create dummy image tensor with batch size 1
+            image_tensor = torch.zeros((1, 3, image_size, image_size), dtype=dtype)
+            image_tensor = image_tensor.to(device=device)
             with torch.no_grad():
                 features = self.model.encode_image(image_tensor)
             self._embedding_dim = int(features.shape[-1])

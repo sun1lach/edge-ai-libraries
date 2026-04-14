@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pathlib
+from pympler import asizeof
 import threading
 import time
 import traceback
@@ -13,6 +14,8 @@ from src.core.embedding.simple_client import SimpleVDMSClient
 from src.core.telemetry.recorder import record_video_telemetry
 from src.common.schema import TelemetryRecord
 from src.core.utils.metadata_utils import store_enhanced_video_metadata
+
+from memory_profiler import profile
 
 # Import SDK-based embedding helper for optimized processing
 from .sdk_embedding_helper import (
@@ -468,7 +471,7 @@ async def generate_video_embedding(
         logger.error(f"Error in video embedding generation: {ex}")
         raise
 
-
+@profile
 async def generate_video_embedding_from_content(
     video_content: bytes,
     bucket_name: str,
@@ -580,7 +583,8 @@ async def generate_video_embedding_from_content(
             )
 
             stored_ids.extend(stream_result["stored_ids"])
-
+        print("SIZE OF STORED IDS:", len(stored_ids))
+        print(asizeof.asizeof(stored_ids))
         return stored_ids
 
     except Exception as ex:
@@ -740,7 +744,7 @@ async def _generate_video_embedding_api_mode(
 
     return ids
 
-
+@profile
 async def _generate_video_embedding_sdk_mode(
     bucket_name: str,
     video_id: str,
