@@ -37,7 +37,7 @@ import numpy as np
 from decord import VideoReader, cpu
 from PIL import Image
 from torchvision.transforms import ToPILImage
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .common import ErrorMessages, logger, settings
 
 decord.bridge.set_bridge("torch")
@@ -104,7 +104,59 @@ class ParallelImagePreprocessor:
                 f"Error during parallel image preprocessing: {e}", exc_info=True
             )
             raise RuntimeError(f"Error during parallel image preprocessing: {e}")
- 
+    
+    def preprocess_stream(self, images):
+        """
+        Yield preprocessed batches as soon as enough images finish.
+        Preserves final output order using indices later.
+        """
+        if not images:
+            raise ValueError("images empty")
+        
+        futures = {}
+        pending_results = {}
+        batch = []
+        try:
+            futures = {
+                self.pool.submit(self.preprocess_fn, img): idx
+                for idx, img in enumerate(images)
+            }
+            images = None  # release original list reference early
+            next_expected = 0
+
+            logger.info("Processing preprocessed images as they complete...")
+            for future in as_completed(futures):
+                # logger.info(f"Image preprocessing completed for future: {future}")
+                idx = futures[future]
+                result = future.result()
+                pending_results[idx] = result
+
+                # release in original order whenever contiguous ready
+                while next_expected in pending_results:
+                    batch.append(pending_results.pop(next_expected))
+                    next_expected += 1
+
+                    if len(batch) == self.batch_size:
+                        logger.info(f"Yielding batch of {len(batch)} preprocessed images starting at index {next_expected - len(batch)}")
+                        out = np.stack(batch).astype(np.float32)
+                        batch.clear()
+                        yield out
+
+            if batch:
+                logger.info(f"Yielding final batch of {len(batch)} preprocessed images starting at index {next_expected - len(batch)}")
+                out = np.stack(batch).astype(np.float32)
+                batch.clear()
+                yield out
+
+        except Exception as e:
+            logger.error(f"Error during parallel image preprocessing stream: {e}", exc_info=True)
+            raise RuntimeError(f"Error during parallel image preprocessing stream: {e}")
+        
+        finally:
+            futures.clear()
+            pending_results.clear()
+            batch.clear()
+            images = None
 
 _SAFE_LOG_PATTERN = re.compile(r"[\r\n\t\x00-\x1f\x7f]+")
 _VIDEO_TMP_DIR = Path(tempfile.gettempdir()) / "videoQnA"

@@ -229,22 +229,30 @@ class CLIPHandler(BaseEmbeddingModel):
         """
         if isinstance(images, Image.Image):
             images = [images]
-
+        total_images = len(images)
         logger.info(f"====AsyncInferQueue====")
         pre_process_start = time.perf_counter()
-        pre_processed_images = self.parallel_preprocessor.preprocess_images(images)
+        preprocess_stream = self.parallel_preprocessor.preprocess_stream(images)
         preprocess_end = time.perf_counter()
-        infer_start = time.perf_counter()
-        embeddings = self.async_infer.infer(pre_processed_images)
-        infer_end = time.perf_counter()
-        logger.info(f"Inference time for batch of {len(images)} images: {infer_end - infer_start:.4f} seconds")
+        try:
+            logger.info(f"Preprocessing time for batch of {total_images} images: {preprocess_end - pre_process_start:.4f} seconds")
+            infer_start = time.perf_counter()
+            embeddings = self.async_infer.infer_stream(batch_generator=preprocess_stream, total_images=total_images)
+            infer_end = time.perf_counter()
+        finally:
+            preprocess_stream.close()
+            del images
+
+        logger.info(f"Inference time for batch of {total_images} images: {infer_end - infer_start:.4f} seconds")
+        logger.info("Total time for preprocessing and inference: {:.4f} seconds".format(infer_end - pre_process_start))
+
         if metrics_out:
             return {
                 "embeddings": embeddings,
                 "preprocess_time_s": preprocess_end - pre_process_start,
                 "inference_time_s": infer_end - infer_start,
                 "total_time_s": infer_end - pre_process_start,
-                "processed_images": len(images)
+                "processed_images": total_images
             }
         return embeddings
 

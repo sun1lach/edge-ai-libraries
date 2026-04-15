@@ -20,6 +20,7 @@ Performance Benefits:
 """
 
 from datetime import datetime
+import gc
 import json
 import multiprocessing
 import os
@@ -1184,9 +1185,9 @@ def _process_video_from_memory_simple_pipeline(
         tracer.set_process_name("decode_detect_embed_store_pipeline")
 
         logger.info("Initializing shared memory pools for frames and detected crops...")
-        shm_pool = SharedMemoryPool(max_blocks=1024, block_size=1920 * 1080 * 3)
-        crop_pool = (
-            SharedMemoryPool(max_blocks=shm_pool.max_blocks, block_size=shm_pool.block_size)
+        _shm_pool = SharedMemoryPool(max_blocks=1024, block_size=1920 * 1080 * 3)
+        _crop_pool = (
+            SharedMemoryPool(max_blocks=_shm_pool.max_blocks, block_size=_shm_pool.block_size)
             if enable_object_detection
             else None
         )
@@ -1204,7 +1205,7 @@ def _process_video_from_memory_simple_pipeline(
         extractor = VideoFrameExtractor(
             video_content,
             config,
-            shm_pool=shm_pool,
+            shm_pool=_shm_pool,
             shutdown_event=shutdown_event,
             tracer=tracer,
         )
@@ -1239,7 +1240,7 @@ def _process_video_from_memory_simple_pipeline(
             args=(
                 detection_meta_queue,
                 embed_sink_queue,
-                crop_pool,
+                _crop_pool,
                 enable_object_detection,
                 detection_confidence,
                 shutdown_event,
@@ -1250,7 +1251,7 @@ def _process_video_from_memory_simple_pipeline(
         embed_thread = threading.Thread(
             target=embed_worker,
             name="embed_thread",
-            args=(embed_sink_queue, store_queue, shm_pool, crop_pool, shutdown_event, tracer),
+            args=(embed_sink_queue, store_queue, _shm_pool, _crop_pool, shutdown_event, tracer),
         )
 
         store_thread = threading.Thread(
@@ -1296,12 +1297,16 @@ def _process_video_from_memory_simple_pipeline(
 
         total_wall_time_start = now_us()
         # Assuming single video input; can be extended for multiple videos
-        for i, (batch_frame_metadata, batch_times) in enumerate(extractor.decode_frames()):
-            logger.info(f"Processing batch {i} of frames")
-            logger.info(
-                f"Detection queue size: {detection_meta_queue.qsize()}, Embed queue size: {embed_sink_queue.qsize()}, Result queue size: {result_queue.qsize()}"
-            )
-            try:
+        frame_generator = extractor.decode_frames()
+        try:
+            for i, (batch_frame_metadata, batch_times) in enumerate(frame_generator):
+                
+                logger.info(f"Processing batch {i} of frames")
+                logger.info(_shm_pool.stats())
+                logger.info(_crop_pool.stats() if _crop_pool else "No crop pool configured")
+                logger.info(
+                    f"Detection queue size: {detection_meta_queue.qsize()}, Embed queue size: {embed_sink_queue.qsize()}, Result queue size: {result_queue.qsize()}"
+                )
                 stats = batch_frame_metadata.setdefault("stats", {})
                 stats["decode"] = batch_times
                 total_frames_processed += batch_frame_metadata["batch_size"]
@@ -1363,9 +1368,12 @@ def _process_video_from_memory_simple_pipeline(
                     f"Batch {i} processing results queued for detection and embedding workers"
                 )
 
-            except Exception as e:
-                logger.error(f"Error processing frame {i}: {e.with_traceback(e.__traceback__)}")
-                raise
+        except Exception as e:
+            logger.error(f"Error processing frame {i}: {e.with_traceback(e.__traceback__)}")
+            raise
+
+        finally:
+            frame_generator.close()
 
         total_wall_time_elapsed = now_us() - total_wall_time_start
         logger.info(
@@ -1393,11 +1401,9 @@ def _process_video_from_memory_simple_pipeline(
 
         logger.info("Worker threads have been joined successfully")
 
-        shm_pool.close()
-        if crop_pool:
-            crop_pool.close()
-
-        logger.info("Shared memory pool closed and all blocks released")
+        _shm_pool.shutdown()
+        if _crop_pool:
+            _crop_pool.shutdown()
 
         logger.info("Shutdown Tracer!")
         shutdown_tracer()
@@ -1466,6 +1472,7 @@ def process_frame_detection(
             shm = shared_memory.SharedMemory(name=crop_pool.acquire())
             crop_arr = np.ndarray(crop_view.shape, dtype=crop_view.dtype, buffer=shm.buf)
             np.copyto(crop_arr, crop_view)
+            del crop_view  # Release reference to the crop view to free memory
 
             crop_metadata = base_metadata.copy()  # shallow copy for isolation
             crop_metadata.update(
@@ -1487,7 +1494,6 @@ def process_frame_detection(
             )
 
             shm.close()  # Close in this process, the consumer will open it when needed
-
             cropped_results.append(crop_metadata)
 
         except Exception:
@@ -1543,36 +1549,38 @@ def allocate_detected_crops(
     detected_crops_metadata = []
     # ---- Phase 1: Map all frames (zero-copy, fast) ----
     mapped = []
-    for d in batch["frames"]:
-        try:
-            shm, arr, meta = _map_shared_frame(d, to_pil=False)
-            shm_handles.append(shm)
-            mapped.append((arr, meta))
-        except Exception as e:
-            logger.warning(
-                "Failed to map frame %s: %s",
-                d.get("frame_id", "unknown"),
-                str(e),
-            )
 
-    # ---- Phase 2: Parallel detection ----
-    if mapped:
+    try:
+        for d in batch["frames"]:
+            try:
+                shm, arr, meta = _map_shared_frame(d, to_pil=False)
+                shm_handles.append(shm)
+                mapped.append((arr, meta))
+            except Exception as e:
+                logger.warning(
+                    "Failed to map frame %s: %s",
+                    d.get("frame_id", "unknown"),
+                    str(e),
+                )
 
-        def _task(args):
-            arr, meta = args
-            return process_frame_detection(arr, meta, detector=detector, crop_pool=crop_pool)
+        # ---- Phase 2: Parallel detection ----
+        if mapped:
+            def _task(args):
+                arr, meta = args
+                return process_frame_detection(arr, meta, detector=detector, crop_pool=crop_pool)
 
-        for detected in thread_pool.map(_task, mapped):
-            detected_crops_metadata.extend(detected)
+            for detected in thread_pool.map(_task, mapped):
+                detected_crops_metadata.extend(detected)
 
-    # Cleanup mapped shared memory handles
-    logger.info(f"Closing {len(shm_handles)} shared memory handles after detection")
-    for shm in shm_handles:
-        try:
-            shm.close()
-        except Exception as e:
-            logger.warning(f"Failed to close shared memory handle {shm.name}: {e}")
-            raise
+    except Exception as e:
+        logger.error(f"Error during detection worker processing: {e}", exc_info=True)
+        raise
+    finally:
+        mapped.clear()
+        # Cleanup mapped shared memory handles
+        logger.info(f"Closing {len(shm_handles)} shared memory handles after detection")
+        list(thread_pool.map(lambda shm: shm.close(), shm_handles))
+        shm_handles.clear()
 
     return detected_crops_metadata
 
@@ -1586,7 +1594,7 @@ def detection_worker(
     shutdown_event: threading.Event,
     tracer: Tracer,
 ):
-    thread_pool = ThreadPoolExecutor(max_workers=2)
+    thread_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="detection_worker_thread")
     detector = get_global_detector(enable_object_detection, detection_confidence)
 
     tid = threading.get_ident()
@@ -1697,7 +1705,7 @@ def embed_worker(
     shutdown_event: threading.Event,
     tracer: Tracer,
 ):
-    thread_pool = ThreadPoolExecutor(max_workers=2)
+    thread_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="embed_worker_thread")
     _sdk_client = get_sdk_client()
 
     tid = threading.get_ident()
@@ -1724,6 +1732,10 @@ def embed_worker(
         if batch is DONE:
             logger.info("[EMBED_WORKER] Worker received shutdown signal, exiting.")
             break
+
+        frame_batch = None
+        shm_handles = []
+        batch_frame_pil = None
 
         try:
             stats = batch.setdefault("stats", {})
@@ -1798,20 +1810,37 @@ def embed_worker(
 
             store_queue.put((embedding, batch_frame_meta, batch))
 
-            thread_pool.map(
-                lambda d: (
-                    crop_pool.release(d["shm"])
-                    if "is_detected_crop" in d
-                    else shm_pool.release(d["shm"])
-                ),
-                batch_frame_meta,
-            )
-
         except Exception as e:
             logger.error(
                 f"[EMBED_WORKER] Error in embed store worker processing: {e}", exc_info=True
             )
             continue
+        finally:
+            if batch_frame_pil:
+                del batch_frame_pil  # Ensure PIL images are dereferenced before SHM cleanup
+            
+            if frame_batch is not None:
+                del frame_batch
+
+            logger.info(f"Closing {len(shm_handles)} shared memory handles in finally block of embed_worker")
+            for shm in shm_handles:
+                try:
+                    shm.close()
+                except Exception as e:
+                    logger.warning(f"Failed to close shared memory handle {shm.name}: {e}")
+                    raise
+
+            for meta in batch_frame_meta:
+                try:
+                    if "is_detected_crop" in meta:
+                        crop_pool.release(meta["shm"])
+                    else:
+                        shm_pool.release(meta["shm"])
+                except Exception as e:
+                    logger.warning(f"release failed {meta['shm']}: {e}")
+            
+            del shm_handles
+            gc.collect()
 
         logger.debug("[EMBED_WORKER] ONTO NEXT BATCH...")
 

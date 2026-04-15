@@ -42,10 +42,11 @@ logger = logging.getLogger(__name__)
 
 class SharedMemoryPool:
     def __init__(self, max_blocks, block_size):
-        self.free = queue.SimpleQueue()
         self.max_blocks = max_blocks
         self.block_size = block_size
+        self.free = queue.SimpleQueue()
         self.blocks = []
+        self.in_use = set()
 
         for _ in range(max_blocks):
             shm = shared_memory.SharedMemory(create=True, size=block_size)
@@ -53,16 +54,59 @@ class SharedMemoryPool:
             self.free.put(shm.name)
 
     def acquire(self):
-        return self.free.get()
+        name = self.free.get()
+        self.in_use.add(name)
+        return name
 
     def release(self, name):
-        self.free.put(name)
+        if name in self.in_use:
+            self.in_use.remove(name)
+            self.free.put(name)
 
+    def total_blocks(self):
+        return self.max_blocks
+
+    def used_blocks(self):
+        return len(self.in_use)
+
+    def free_blocks(self):
+        return self.max_blocks - len(self.in_use)
+
+    def is_full(self):
+        return self.used_blocks() == self.max_blocks
+
+    def is_empty(self):
+        return self.used_blocks() == 0
+
+    def stats(self):
+        return {
+            "total": self.total_blocks(),
+            "used": self.used_blocks(),
+            "free": self.free_blocks(),
+            "block_size": self.block_size,
+        }
+                
     def close(self):
         for shm in self.blocks:
             shm.close()
-            shm.unlink()
 
+    def unlink(self):
+        try:
+            for shm in self.blocks:
+                shm.unlink()
+        except FileNotFoundError:
+            logger.info("Shared memory already unlinked")
+            pass
+
+    def shutdown(self):
+        self.close()
+        self.unlink()
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
 @dataclass(frozen=True)
 class VideoStreamMetadata:
@@ -261,7 +305,7 @@ def decode_stream_and_batch_generator(
     if tracer is not None and tracer.should_trace():
         tracer.set_thread_name(tid=tid, name=f"decode_stream_sid_{stream_id}")
 
-    with container, ThreadPoolExecutor(max_workers=6) as thread_pool:
+    with container, ThreadPoolExecutor(max_workers=6, thread_name_prefix=f"decode_stream_sid_{stream_id}") as thread_pool:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
 
@@ -397,7 +441,7 @@ def decode_and_batch_generator(
     if tracer is not None and tracer.should_trace():
         tracer.set_thread_name(tid=tid, name=f"decode_sid_{stream_id}")
 
-    with container, ThreadPoolExecutor(max_workers=6) as _thread_pool:
+    with container, ThreadPoolExecutor(max_workers=6, thread_name_prefix=f"decode_stream_sid_{stream_id}") as _thread_pool:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
 
